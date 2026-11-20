@@ -9,6 +9,7 @@ import fnmatch
 import fcntl
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -25,6 +26,9 @@ from typing import Any
 
 
 MAX_TASK_BYTES = 1_000_000
+TERMINAL_JOB_STATES = frozenset(
+    {"succeeded", "failed", "cancelled", "timed_out", "scope_violated", "lost"}
+)
 QUALITY_FIRST_CONTEXT_BYTES = 65_536
 TERRA_FALLBACK_CONTEXT_BYTES = 32_768
 REQUIRED_TASK_SECTIONS = (
@@ -530,7 +534,7 @@ def save_preferences(preferences: dict[str, str]) -> None:
 def read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerError(f"Cannot read valid JSON from {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise RunnerError(f"Expected a JSON object in {path}")
@@ -1653,6 +1657,167 @@ def git_snapshot(workspace: Path) -> dict[str, Any]:
     }
 
 
+def _not_a_git_worktree(literal: Path) -> dict[str, Any]:
+    return {
+        "is_git": False,
+        "is_work_tree": False,
+        "root": str(literal),
+        "git_common_dir": None,
+        "project_id": None,
+        "workspace": str(literal),
+    }
+
+
+def _git_rev_parse_env() -> dict[str, str]:
+    """Force stable, machine-checkable Git diagnostics regardless of locale."""
+    return {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"}
+
+
+def canonical_workspace(workspace: Path) -> dict[str, Any]:
+    """Resolve a checkout, subdirectory, or linked worktree to one Git identity.
+
+    B1 admission compares this canonical root so alternate path forms cannot
+    enter an enrolled project. Git administrative directories (``<repo>/.git``
+    and its children) and bare repositories keep their Git common directory and
+    therefore an admission identity; only ``is_work_tree`` distinguishes a
+    usable plan checkout. Unexpected Git failures (timeouts, missing git,
+    dubious ownership, corrupt repositories) fail closed instead of silently
+    classifying an enrolled checkout as a plain directory. Only an explicit
+    "not a git repository" answer keeps legacy non-Git workspace support, and
+    diagnostics are requested in the C locale so that answer is unambiguous.
+    """
+    literal = Path(workspace).expanduser().resolve()
+    if not literal.is_dir():
+        return _not_a_git_worktree(literal)
+    env = _git_rev_parse_env()
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(literal), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(
+            f"Timed out resolving canonical Git identity for {literal}"
+        ) from exc
+    except OSError as exc:
+        raise RunnerError(
+            f"Cannot resolve canonical Git identity for {literal}: {exc}"
+        ) from exc
+    if inside.returncode != 0:
+        stderr = (inside.stderr or "").casefold()
+        if "not a git repository" in stderr or "not a git work tree" in stderr:
+            return _not_a_git_worktree(literal)
+        raise RunnerError(
+            f"Cannot resolve canonical Git identity for {literal}: "
+            f"{inside.stderr.strip() or 'git rev-parse failed'}"
+        )
+    is_work_tree = inside.stdout.strip() == "true"
+    try:
+        common = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(literal),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=env,
+        )
+        if common.returncode != 0:
+            # Older Git versions do not understand --path-format; retry and
+            # resolve the reported path relative to the queried directory.
+            common = subprocess.run(
+                ["git", "-C", str(literal), "rev-parse", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=env,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(
+            f"Timed out resolving the Git common directory for {literal}"
+        ) from exc
+    except OSError as exc:
+        raise RunnerError(
+            f"Cannot resolve the Git common directory for {literal}: {exc}"
+        ) from exc
+    lines = common.stdout.splitlines()
+    if common.returncode != 0 or len(lines) != 1 or not lines[0].strip():
+        raise RunnerError(
+            f"Could not resolve canonical Git identity for {literal}: "
+            f"{common.stderr.strip() or 'git rev-parse failed'}"
+        )
+    raw_common = Path(lines[0].strip())
+    if not raw_common.is_absolute():
+        raw_common = literal / raw_common
+    common_dir = raw_common.resolve()
+    if not common_dir.is_dir():
+        raise RunnerError(
+            f"Git common directory for {literal} does not exist: {common_dir}"
+        )
+    # A normal checkout stores its metadata in ``<root>/.git`` and all linked
+    # worktrees share that directory. Bare repositories, submodules and
+    # ``--separate-git-dir`` checkouts keep distinct common directories, which
+    # must stay distinct identities instead of collapsing onto a shared parent.
+    if is_work_tree:
+        root = common_dir.parent.resolve() if common_dir.name == ".git" else common_dir
+    else:
+        # ``<repo>/.git``, its children and a bare repository report
+        # ``--is-inside-work-tree`` = false. They are still members of the same
+        # repository and must resolve to its root so admission cannot be
+        # bypassed by addressing the administrative directory directly.
+        try:
+            bare = subprocess.run(
+                ["git", "-C", str(literal), "rev-parse", "--is-bare-repository"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError(
+                f"Timed out resolving whether {literal} is a bare Git repository"
+            ) from exc
+        except OSError as exc:
+            raise RunnerError(
+                f"Cannot resolve whether {literal} is a bare Git repository: {exc}"
+            ) from exc
+        if bare.returncode != 0:
+            raise RunnerError(
+                f"Cannot resolve canonical Git identity for {literal}: "
+                f"{bare.stderr.strip() or 'git rev-parse --is-bare-repository failed'}"
+            )
+        is_bare = bare.stdout.strip() == "true"
+        # Separate-git-dir checkouts and submodules keep a common directory
+        # whose name is not ``.git``; the work tree and every administrative
+        # path beneath that directory must resolve to that exact identity, not
+        # to a parent shared with sibling repositories.
+        root = (
+            common_dir
+            if is_bare or common_dir.name != ".git"
+            else common_dir.parent.resolve()
+        )
+    return {
+        "is_git": True,
+        "is_work_tree": is_work_tree,
+        "root": str(root),
+        "git_common_dir": str(common_dir),
+        "project_id": "p-" + hashlib.sha256(str(root).encode()).hexdigest()[:24],
+        "workspace": str(literal),
+    }
+
+
 def status_paths(status_lines: list[str]) -> set[str]:
     paths: set[str] = set()
     for line in status_lines:
@@ -1714,6 +1879,41 @@ def plan_dir(plan_id: str, must_exist: bool = True) -> Path:
     return path
 
 
+_B1_MODULE: Any = None
+
+
+def b1_module():
+    """Load the sibling consensus module by absolute path.
+
+    Test and dashboard callers load this runner through ``importlib`` without
+    adding the scripts directory to ``sys.path``; a normal import would fail.
+    """
+    global _B1_MODULE
+    if _B1_MODULE is None:
+        module_path = Path(__file__).resolve().with_name("b1_consensus.py")
+        spec = importlib.util.spec_from_file_location(
+            "agent_orchestrator_b1_consensus", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RunnerError(f"Cannot load consensus module: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _B1_MODULE = module
+    _B1_MODULE.configure(
+        runner_error=RunnerError,
+        state_home=state_home,
+        plans_dir=plans_dir,
+        plan_dir=plan_dir,
+        record_lock=record_lock,
+        write_json=write_json,
+        utc_now=utc_now,
+        canonical_workspace=canonical_workspace,
+        active_jobs_for_identity=active_jobs_for_canonical_workspace,
+    )
+    return _B1_MODULE
+
+
 def plan_items(text: str) -> list[dict[str, Any]]:
     return [
         {
@@ -1743,6 +1943,9 @@ def read_plan(plan_id: str) -> tuple[Path, dict[str, Any]]:
 
 
 def save_plan(path: Path, plan: dict[str, Any]) -> None:
+    # Managed research plans are projections of the consensus ledger, and a
+    # legacy plan in an enrolled checkout must not bypass the B1 gate either.
+    b1_module().require_legacy_plan_mutable(plan)
     plan["updated_at"] = utc_now()
     counts: dict[str, int] = {}
     for item in plan.get("items", []):
@@ -1759,33 +1962,7 @@ def save_plan(path: Path, plan: dict[str, Any]) -> None:
     write_json(path / "plan.json", plan)
 
 
-def command_create_plan(args: argparse.Namespace) -> int:
-    source = Path(args.plan_file).expanduser().resolve()
-    workspace = Path(args.workspace).expanduser().resolve()
-    if not source.is_file():
-        raise RunnerError(f"Plan file does not exist: {source}")
-    if not workspace.is_dir():
-        raise RunnerError(f"Workspace is not a directory: {workspace}")
-    if source.stat().st_size > MAX_TASK_BYTES:
-        raise RunnerError(f"Plan file exceeds {MAX_TASK_BYTES} bytes")
-    text = source.read_text(encoding="utf-8")
-    problems = validate_named_sections(text, REQUIRED_PLAN_SECTIONS)
-    items = plan_items(text)
-    if not items:
-        problems.append("Checklist must contain at least one '- [ ]' item")
-    if problems:
-        raise RunnerError("Plan is incomplete: " + "; ".join(problems))
-    selected_plan_id = (
-        args.plan_id
-        or f"plan-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-    )
-    path = plan_dir(selected_plan_id, must_exist=False)
-    if path.exists():
-        raise RunnerError(f"Plan already exists: {selected_plan_id}")
-    path.mkdir(parents=True, mode=0o700)
-    plan_copy = path / "plan.md"
-    shutil.copyfile(source, plan_copy)
-    os.chmod(plan_copy, 0o600)
+def resolve_create_plan_executor_policy(args: argparse.Namespace) -> dict[str, Any]:
     if args.executor or args.expensive_executor:
         policy = executor_policy(
             args.executor, args.expensive_executor, args.terra_fallback_after_seconds
@@ -1796,44 +1973,153 @@ def command_create_plan(args: argparse.Namespace) -> int:
             authorization_source="explicit_executor_allowlist",
             max_attempts_per_item=3,
         )
-    else:
-        if args.terra_fallback_after_seconds is not None:
-            raise RunnerError(
-                "Automatic executor selection does not use a separate Terra fallback"
-            )
-        policy = automatic_executor_policy(
-            args.strategy,
-            args.risk,
-            load_profiles(config_path(args.config)),
-            args.task_type,
+        return policy
+    if args.terra_fallback_after_seconds is not None:
+        raise RunnerError(
+            "Automatic executor selection does not use a separate Terra fallback"
         )
+    return automatic_executor_policy(
+        args.strategy,
+        args.risk,
+        load_profiles(config_path(args.config)),
+        args.task_type,
+    )
+
+
+def read_manifest_file(value: str) -> dict[str, Any]:
+    source = Path(value).expanduser().resolve()
+    if not source.is_file():
+        raise RunnerError(f"Manifest file does not exist: {source}")
+    if source.stat().st_size > MAX_TASK_BYTES:
+        raise RunnerError(f"Manifest file exceeds {MAX_TASK_BYTES} bytes")
+    try:
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerError(
+            f"Cannot read valid manifest JSON from {source}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RunnerError(f"Expected a JSON object in {source}")
+    return manifest
+
+
+def command_create_plan(args: argparse.Namespace) -> int:
+    source = Path(args.plan_file).expanduser().resolve()
+    workspace = Path(args.workspace).expanduser().resolve()
+    if not source.is_file():
+        raise RunnerError(f"Plan file does not exist: {source}")
+    if not workspace.is_dir():
+        raise RunnerError(f"Workspace is not a directory: {workspace}")
+    if source.stat().st_size > MAX_TASK_BYTES:
+        raise RunnerError(f"Plan file exceeds {MAX_TASK_BYTES} bytes")
+    if args.manifest_file and not args.research_team:
+        raise RunnerError("--manifest-file requires --research-team")
+    if args.research_team and not args.manifest_file:
+        raise RunnerError("--research-team requires a structured --manifest-file")
+    try:
+        text = source.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RunnerError(f"Cannot read plan file {source}: {exc}") from exc
+    problems = validate_named_sections(text, REQUIRED_PLAN_SECTIONS)
+    items = plan_items(text)
+    if not items:
+        problems.append("Checklist must contain at least one '- [ ]' item")
+    if args.research_team:
+        prechecked = [
+            title
+            for marker, title in CHECKLIST_RE.findall(text)
+            if marker.casefold() == "x"
+        ]
+        if prechecked:
+            raise RunnerError(
+                "Research-team plans reject prechecked boxes; record evidence through the "
+                "consensus ledger instead: " + "; ".join(prechecked)
+            )
+    if problems:
+        raise RunnerError("Plan is incomplete: " + "; ".join(problems))
+    selected_plan_id = (
+        args.plan_id
+        or f"plan-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+    )
     preferences = load_preferences()
-    plan = {
-        "plan_id": selected_plan_id,
-        "title": args.title,
-        "workspace": str(workspace),
-        "created_at": utc_now(),
-        "plan_file": str(plan_copy),
-        "plan_sha256": hashlib.sha256(plan_copy.read_bytes()).hexdigest(),
-        "workspace_mode": preferences["workspace_mode"],
-        "team_policy": {
-            "topology": args.topology,
-            "max_parallel": args.max_parallel,
-            "native_subagents": "deny",
-            "ownership": "agent-orchestrator",
-        },
-        "goal": {
-            "objective": named_section_body(text, "Goal"),
-            "status": "active",
-            "strategy": args.strategy,
-            "risk": args.risk,
-            "task_type": args.task_type,
+    if args.research_team:
+        manifest_raw = read_manifest_file(args.manifest_file)
+        policy = resolve_create_plan_executor_policy(args)
+        try:
+            plan_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise RunnerError(f"Cannot read plan file {source}: {exc}") from exc
+        managed = b1_module().create_managed_plan(
+            plan_id=selected_plan_id,
+            title=args.title,
+            workspace=workspace,
+            plan_file=source,
+            plan_sha256=plan_sha256,
+            workspace_mode=preferences["workspace_mode"],
+            goal={
+                "objective": named_section_body(text, "Goal"),
+                "status": "active",
+                "strategy": args.strategy,
+                "risk": args.risk,
+                "task_type": args.task_type,
+                "created_at": utc_now(),
+            },
+            team_policy={
+                "topology": args.topology,
+                "max_parallel": args.max_parallel,
+                "native_subagents": "deny",
+                "ownership": "agent-orchestrator",
+            },
+            executor_policy=policy,
+            manifest_raw=manifest_raw,
+            policy_version=args.policy_version,
+        )
+        output = dict(managed["plan"])
+        output["idempotent"] = bool(managed.get("idempotent"))
+        print(
+            json.dumps(output, indent=2, sort_keys=True)
+            if args.json
+            else selected_plan_id
+        )
+        return 0
+    # Hold the repository/registry admission locks across the legacy plan
+    # creation so a concurrent --research-team enrollment cannot slip between
+    # the check and the published plan.json.
+    with b1_module().legacy_plan_creation_admission(workspace):
+        path = plan_dir(selected_plan_id, must_exist=False)
+        if path.exists():
+            raise RunnerError(f"Plan already exists: {selected_plan_id}")
+        path.mkdir(parents=True, mode=0o700)
+        plan_copy = path / "plan.md"
+        shutil.copyfile(source, plan_copy)
+        os.chmod(plan_copy, 0o600)
+        policy = resolve_create_plan_executor_policy(args)
+        plan = {
+            "plan_id": selected_plan_id,
+            "title": args.title,
+            "workspace": str(workspace),
             "created_at": utc_now(),
-        },
-        "executor_policy": policy,
-        "items": items,
-    }
-    save_plan(path, plan)
+            "plan_file": str(plan_copy),
+            "plan_sha256": hashlib.sha256(plan_copy.read_bytes()).hexdigest(),
+            "workspace_mode": preferences["workspace_mode"],
+            "team_policy": {
+                "topology": args.topology,
+                "max_parallel": args.max_parallel,
+                "native_subagents": "deny",
+                "ownership": "agent-orchestrator",
+            },
+            "goal": {
+                "objective": named_section_body(text, "Goal"),
+                "status": "active",
+                "strategy": args.strategy,
+                "risk": args.risk,
+                "task_type": args.task_type,
+                "created_at": utc_now(),
+            },
+            "executor_policy": policy,
+            "items": items,
+        }
+        save_plan(path, plan)
     output = read_json(path / "plan.json")
     print(
         json.dumps(output, indent=2, sort_keys=True) if args.json else selected_plan_id
@@ -1854,6 +2140,31 @@ def command_preferences(args: argparse.Namespace) -> int:
 
 
 def command_plan_status(args: argparse.Namespace) -> int:
+    managed = b1_module().load_managed_plan(args.plan_id, regenerate=True)
+    if managed is not None:
+        plan = managed["plan"]
+        checkpoint = managed["checkpoint"]
+        if args.json:
+            print(json.dumps(plan, indent=2, sort_keys=True))
+        else:
+            print(f"plan_id: {plan['plan_id']}")
+            print(f"title: {plan['title']}")
+            print("managed: true")
+            print(f"consensus_state: {checkpoint['consensus_state']}")
+            print(f"policy: {plan['policy']['name']} v{plan['policy']['version']}")
+            if checkpoint.get("historical_read_only"):
+                print("historical_read_only: true")
+                print(f"replacement_guidance: {checkpoint.get('replacement_guidance')}")
+            print(f"complete: {plan.get('complete', False)}")
+            for item in plan.get("items", []):
+                print(
+                    f"{item['id']}\t{item['consensus_state']}\t{item['title']}"
+                )
+            if checkpoint.get("missing_actions"):
+                print("missing_actions:")
+                for action in checkpoint["missing_actions"]:
+                    print(f"- {action}")
+        return 0
     _, plan = read_plan(args.plan_id)
     if args.json:
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -1920,6 +2231,15 @@ def compact_job_status(status: dict[str, Any]) -> dict[str, Any]:
 
 
 def command_plan_checkpoint(args: argparse.Namespace) -> int:
+    managed = b1_module().load_managed_plan(args.plan_id, regenerate=True)
+    if managed is not None:
+        output = managed["checkpoint"]
+        print(
+            json.dumps(output, indent=2, sort_keys=True)
+            if args.json
+            else json.dumps(output, sort_keys=True)
+        )
+        return 0
     _, plan = read_plan(args.plan_id)
     jobs: list[dict[str, Any]] = []
     usage: dict[str, float] = {}
@@ -1975,6 +2295,129 @@ def command_plan_checkpoint(args: argparse.Namespace) -> int:
         else json.dumps(output, sort_keys=True)
     )
     return 0
+
+
+def read_bounded_json_file(value: str, label: str, maximum: int) -> Any:
+    source = Path(value).expanduser().resolve()
+    if not source.is_file():
+        raise RunnerError(f"{label} file does not exist: {source}")
+    if source.stat().st_size > maximum:
+        raise RunnerError(f"{label} file exceeds {maximum} bytes")
+    try:
+        return json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"Cannot read valid {label} JSON: {exc}") from exc
+
+
+def print_consensus_result(result: dict[str, Any], as_json: bool) -> int:
+    print(
+        json.dumps(result, indent=2, sort_keys=True)
+        if as_json
+        else json.dumps(result, sort_keys=True)
+    )
+    return 0
+
+
+def command_consensus_submit(args: argparse.Namespace) -> int:
+    b1 = b1_module()
+    submission = read_bounded_json_file(
+        args.submission_file, "submission", b1.MAX_SUBMISSION_BYTES
+    )
+    result = b1.submit_consensus(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        role=args.role,
+        round_number=args.round_number,
+        submission_raw=submission,
+        job_id=args.job_id,
+        leader=args.leader,
+        retry_id=args.retry_id,
+        operation_id=args.operation_id,
+    )
+    return print_consensus_result(result, args.json)
+
+
+def command_consensus_freeze(args: argparse.Namespace) -> int:
+    b1 = b1_module()
+    candidate = read_bounded_json_file(
+        args.candidate_file, "candidate", b1.MAX_CANDIDATE_BYTES
+    )
+    result = b1.freeze_candidate(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        candidate_raw=candidate,
+        operation_id=args.operation_id,
+    )
+    return print_consensus_result(result, args.json)
+
+
+def command_consensus_vote(args: argparse.Namespace) -> int:
+    result = b1_module().cast_ballot(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        role=args.role,
+        digest=args.digest,
+        vote=args.vote,
+        rationale=args.rationale,
+        job_id=args.job_id,
+        leader=args.leader,
+        retry_id=args.retry_id,
+        operation_id=args.operation_id,
+    )
+    return print_consensus_result(result, args.json)
+
+
+def command_consensus_pause(args: argparse.Namespace) -> int:
+    result = b1_module().pause_provider(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        role=args.role,
+        reason=args.reason,
+        guidance=args.guidance,
+        job_id=args.job_id,
+        leader=args.leader,
+        operation_id=args.operation_id,
+    )
+    return print_consensus_result(result, args.json)
+
+
+def command_consensus_resume(args: argparse.Namespace) -> int:
+    result = b1_module().resume_provider(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        role=args.role,
+        retry_id=args.retry_id,
+        operation_id=args.operation_id,
+    )
+    return print_consensus_result(result, args.json)
+
+
+def command_consensus_new_cycle(args: argparse.Namespace) -> int:
+    if bool(args.authorization) == bool(args.authorization_file):
+        raise RunnerError(
+            "Provide exactly one of --authorization or --authorization-file"
+        )
+    authorization = args.authorization
+    if args.authorization_file:
+        source = Path(args.authorization_file).expanduser().resolve()
+        if not source.is_file():
+            raise RunnerError(f"Authorization file does not exist: {source}")
+        if source.stat().st_size > MAX_TASK_BYTES:
+            raise RunnerError(f"Authorization file exceeds {MAX_TASK_BYTES} bytes")
+        try:
+            authorization = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RunnerError(
+                f"Cannot read authorization file {source}: {exc}"
+            ) from exc
+    result = b1_module().authorize_new_cycle(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        authorized_by=args.authorized_by,
+        authorization=authorization,
+        operation_id=args.operation_id,
+    )
+    return print_consensus_result(result, args.json)
 
 
 def command_metrics(args: argparse.Namespace) -> int:
@@ -2155,6 +2598,7 @@ def command_recommend_executors(args: argparse.Namespace) -> int:
 
 def command_set_executors(args: argparse.Namespace) -> int:
     path, plan = read_plan(args.plan_id)
+    b1_module().require_legacy_plan_mutable(plan)
     policy = executor_policy(
         args.executor, args.expensive_executor, args.terra_fallback_after_seconds
     )
@@ -2360,6 +2804,7 @@ def claim_feedback_for_fallback(feedback_id: str, job_id: str) -> None:
 
 def bind_plan_item(plan_id: str, item_id: str, job_id: str) -> None:
     path, plan = read_plan(plan_id)
+    b1_module().require_legacy_plan_mutable(plan)
     matching = [item for item in plan.get("items", []) if item.get("id") == item_id]
     if not matching:
         raise RunnerError(f"Unknown checklist item {item_id!r} in plan {plan_id}")
@@ -2876,6 +3321,81 @@ def active_jobs_for_workspace(workspace: Path) -> list[str]:
     return active
 
 
+def canonical_job_identity(meta: dict[str, Any]) -> str | None:
+    canonical = meta.get("canonical_workspace")
+    if isinstance(canonical, str) and canonical:
+        return canonical
+    workspace = meta.get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        return None
+    try:
+        identity = canonical_workspace(Path(workspace))
+    except (RunnerError, OSError):
+        return None
+    return identity.get("root") if identity.get("is_git") else None
+
+
+def _job_process_alive(meta: dict[str, Any]) -> bool:
+    """Return whether a job meta record still names a live process.
+
+    A recorded provider may outlive a killed worker, so every process slot is
+    consulted. An unprobeable process is treated as alive so a transient
+    permission failure cannot let enrollment run over a live writer.
+    """
+    for key in ("worker_pid", "provider_pid", "child_pid"):
+        pid = meta.get(key)
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OverflowError):
+            continue
+        except OSError:
+            return True
+        return True
+    return False
+
+
+def active_jobs_for_canonical_workspace(root: str) -> list[str]:
+    """Return active jobs in one canonical Git checkout, including subdirectories.
+
+    AG-R3-001: every recorded worker/provider/child process is probed as soon
+    as the canonical identity matches and before any result or secondary status
+    evidence is consulted. A live or unprobeable recorded process keeps the
+    checkout reserved even when the worker died, the result file is missing or
+    the status heartbeat is malformed. Only after all recorded processes are
+    known dead may a published result or status show the job is terminal.
+    """
+    active: list[str] = []
+    jobs_root = jobs_dir()
+    if not jobs_root.exists():
+        return active
+    for path in jobs_root.iterdir():
+        if not path.is_dir() or not (path / "meta.json").is_file():
+            continue
+        try:
+            meta = read_json(path / "meta.json")
+            if canonical_job_identity(meta) != root:
+                continue
+            job_id = str(meta.get("job_id") or path.name)
+            if _job_process_alive(meta):
+                active.append(job_id)
+                continue
+            # No recorded child, provider or worker is alive. A published
+            # terminal result is then authoritative: a stale ``state=starting``
+            # record (a fast worker, a failed Popen or a lost worker) must never
+            # wedge enrollment forever.
+            if (path / "result.json").is_file():
+                continue
+            status = get_status(path)
+        except RunnerError:
+            continue
+        state = status.get("execution_state")
+        if state in {"starting", "running", "cancelling"}:
+            active.append(str(status.get("job_id") or path.name))
+    return active
+
+
 def validate_dependencies(job_ids: list[str]) -> None:
     for dependency in job_ids:
         status = get_status(job_dir(dependency))
@@ -2884,6 +3404,74 @@ def validate_dependencies(job_ids: list[str]) -> None:
                 f"Dependency {dependency} is {status.get('state')} with review "
                 f"{status.get('review_state')}; launch only after it is independently accepted"
             )
+
+
+def merge_job_meta(meta_path: Path, meta: dict[str, Any]) -> dict[str, Any]:
+    """Merge a worker's in-memory meta into the latest durable record.
+
+    The launching parent may have added its worker PID while the worker was
+    starting. Merging under the record lock preserves those fields instead of
+    replacing the record with a stale snapshot.
+    """
+    latest: dict[str, Any] = {}
+    if meta_path.is_file():
+        try:
+            latest = read_json(meta_path)
+        except RunnerError:
+            latest = {}
+    latest.update(meta)
+    write_json(meta_path, latest)
+    return latest
+
+
+def record_launch_failure(
+    path: Path, meta: dict[str, Any], error: str
+) -> None:
+    """Publish a terminal failure when the worker process cannot be spawned."""
+    finished_at = utc_now()
+    result = {
+        "state": "failed",
+        "started_at": finished_at,
+        "finished_at": finished_at,
+        "duration_seconds": 0.0,
+        "exit_code": 127,
+        "timed_out": False,
+        "scope_violations": [],
+        "usage_summary": None,
+        "startup_error": error[:2000],
+    }
+    with record_lock(path / "meta.json"):
+        write_json(path / "result.json", result)
+        meta.update(result)
+        write_json(path / "meta.json", meta)
+    add_event(path, "worker_start_failed", error=result["startup_error"])
+
+
+def merge_launch_worker_pid(
+    path: Path, meta: dict[str, Any], worker_pid: int
+) -> None:
+    """Record the spawned worker without overwriting newer job state.
+
+    The worker runs concurrently with the launching parent. A terminal result
+    or a state already advanced past ``starting`` is authoritative; the parent
+    only fills in the worker PID while the record is still in its startup
+    window. The job record lock closes the read/write race with the worker's
+    own terminal publication.
+    """
+    meta_path = path / "meta.json"
+    try:
+        with record_lock(meta_path):
+            if (path / "result.json").is_file():
+                return
+            latest = read_json(meta_path) if meta_path.is_file() else dict(meta)
+            if latest.get("state") in TERMINAL_JOB_STATES:
+                return
+            latest["worker_pid"] = worker_pid
+            write_json(meta_path, latest)
+    except (OSError, RunnerError):
+        # The admission reservation still names this live worker; failing to
+        # merge the PID delays cleanup but cannot admit another writer.
+        return
 
 
 def command_launch(args: argparse.Namespace) -> int:
@@ -2984,83 +3572,104 @@ def command_launch(args: argparse.Namespace) -> int:
     path = job_dir(selected_job_id, must_exist=False)
     if path.exists():
         raise RunnerError(f"Job already exists: {selected_job_id}")
-    if fallback_feedback:
-        claim_feedback_for_fallback(fallback_feedback["id"], selected_job_id)
     state_home().mkdir(parents=True, exist_ok=True, mode=0o700)
-    jobs_dir().mkdir(exist_ok=True, mode=0o700)
-    path.mkdir(mode=0o700)
-    original_task = path / "task-original.md"
-    shutil.copyfile(task_source, original_task)
-    os.chmod(original_task, 0o600)
-    channel_path = write_channel_wrapper(path, selected_job_id)
-    task_copy = path / "task.md"
-    task_copy.write_text(
-        coordination_preamble(channel_path) + original_task.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    os.chmod(task_copy, 0o600)
-    task_sha256 = hashlib.sha256(task_copy.read_bytes()).hexdigest()
-    command, transport = build_command(
-        profile,
-        workspace,
-        task_copy,
-        args.model,
-        args.cli_agent,
-        args.max_turns,
-        args.max_cost_usd,
-        args.reasoning_effort,
-        channel_path.parent,
-    )
-    redacted_command = [
-        "<prompt_text>" if token == task_copy.read_text(encoding="utf-8") else token
-        for token in command
-    ]
-    meta = {
-        "job_id": selected_job_id,
-        "agent": args.cli,
-        "cli": args.cli,
-        "workspace": str(workspace),
-        "created_at": utc_now(),
-        "state": "starting",
-        "timeout_seconds": args.timeout_seconds,
-        "notify": args.notify,
-        "group": args.group,
-        "role": args.role,
-        "depends_on": args.depends_on,
-        "profile": profile,
-        "prompt_transport": transport,
-        "model": args.model,
-        "route": args.route,
-        "coordinator_model": args.coordinator_model,
-        "reasoning_effort": args.reasoning_effort,
-        "task_type": (
-            (plan.get("goal") or {}).get("task_type") if plan is not None else "general"
-        ),
-        "cli_agent": args.cli_agent,
-        "max_turns": args.max_turns,
-        "max_cost_usd": args.max_cost_usd,
-        "executor_policy": applied_executor_policy,
-        "terra_fallback_feedback_id": (
-            fallback_feedback.get("id") if fallback_feedback else None
-        ),
-        "task_sha256": task_sha256,
-        "task_stats": task_stats,
-        "context_budget_bytes": route.get("context_budget_bytes") if route else None,
-        "review_required": (
-            route.get("review", {}).get("required", True) if route else True
-        ),
-        "plan_id": args.plan_id,
-        "checklist_item": args.checklist_item,
-        "scope": {
-            "allowed_paths": args.allow_path,
-            "denied_paths": args.deny_path,
-            "max_changed_files": args.max_changed_files,
-        },
-        "git_baseline": snapshot,
-        "command": redacted_command,
-        "channel": str(channel_path),
-    }
-    write_json(path / "meta.json", meta)
+    # Admission and enrollment share the canonical-identity registry lock. The
+    # job-visible starting record is published before the lock is released so a
+    # concurrent create-plan cannot enroll over this active job.
+    with b1_module().launch_admission(workspace, args.plan_id) as identity:
+        if path.exists():
+            raise RunnerError(f"Job already exists: {selected_job_id}")
+        if fallback_feedback:
+            claim_feedback_for_fallback(fallback_feedback["id"], selected_job_id)
+        jobs_dir().mkdir(exist_ok=True, mode=0o700)
+        path.mkdir(mode=0o700)
+        original_task = path / "task-original.md"
+        shutil.copyfile(task_source, original_task)
+        os.chmod(original_task, 0o600)
+        channel_path = write_channel_wrapper(path, selected_job_id)
+        task_copy = path / "task.md"
+        task_copy.write_text(
+            coordination_preamble(channel_path)
+            + original_task.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        os.chmod(task_copy, 0o600)
+        task_sha256 = hashlib.sha256(task_copy.read_bytes()).hexdigest()
+        command, transport = build_command(
+            profile,
+            workspace,
+            task_copy,
+            args.model,
+            args.cli_agent,
+            args.max_turns,
+            args.max_cost_usd,
+            args.reasoning_effort,
+            channel_path.parent,
+        )
+        redacted_command = [
+            "<prompt_text>" if token == task_copy.read_text(encoding="utf-8") else token
+            for token in command
+        ]
+        meta = {
+            "job_id": selected_job_id,
+            "agent": args.cli,
+            "cli": args.cli,
+            "workspace": str(workspace),
+            "canonical_workspace": (
+                identity.get("root") if identity.get("is_git") else None
+            ),
+            "created_at": utc_now(),
+            "state": "starting",
+            "timeout_seconds": args.timeout_seconds,
+            "notify": args.notify,
+            "group": args.group,
+            "role": args.role,
+            "depends_on": args.depends_on,
+            "profile": profile,
+            "prompt_transport": transport,
+            "model": args.model,
+            "route": args.route,
+            "coordinator_model": args.coordinator_model,
+            "reasoning_effort": args.reasoning_effort,
+            "task_type": (
+                (plan.get("goal") or {}).get("task_type")
+                if plan is not None
+                else "general"
+            ),
+            "cli_agent": args.cli_agent,
+            "max_turns": args.max_turns,
+            "max_cost_usd": args.max_cost_usd,
+            "executor_policy": applied_executor_policy,
+            "terra_fallback_feedback_id": (
+                fallback_feedback.get("id") if fallback_feedback else None
+            ),
+            "task_sha256": task_sha256,
+            "task_stats": task_stats,
+            "context_budget_bytes": route.get("context_budget_bytes") if route else None,
+            "review_required": (
+                route.get("review", {}).get("required", True) if route else True
+            ),
+            "plan_id": args.plan_id,
+            "checklist_item": args.checklist_item,
+            "scope": {
+                "allowed_paths": args.allow_path,
+                "denied_paths": args.deny_path,
+                "max_changed_files": args.max_changed_files,
+            },
+            "git_baseline": snapshot,
+            "command": redacted_command,
+            "channel": str(channel_path),
+        }
+        # Publish the repository-local reservation before releasing admission
+        # locks. Enrollment in any state home consults this record, so a launch
+        # admitted here can never be enrolled over while its processes live.
+        # The returned token names this launch uniquely: identical job IDs
+        # admitted through other state homes keep separate records.
+        reservation_id = b1_module().reserve_active_job(
+            identity, selected_job_id, path, os.getpid()
+        )
+        meta["reservation_id"] = reservation_id
+        write_json(path / "meta.json", meta)
     add_event(
         path,
         "job_created",
@@ -3079,23 +3688,47 @@ def command_launch(args: argparse.Namespace) -> int:
     if args.plan_id:
         bind_plan_item(args.plan_id, args.checklist_item, selected_job_id)
     runner_log = (path / "runner.log").open("ab", buffering=0)
-    worker = subprocess.Popen(
-        [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "_worker",
-            "--job-dir",
-            str(path),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=runner_log,
-        stderr=runner_log,
-        start_new_session=True,
-        close_fds=True,
-    )
+    try:
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_worker",
+                "--job-dir",
+                str(path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=runner_log,
+            stderr=runner_log,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception as exc:
+        runner_log.close()
+        # A failed spawn must not leave a job that looks like it is still
+        # starting: publish the terminal failure, then release only this
+        # launch's reservation.
+        try:
+            record_launch_failure(
+                path, meta, f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            b1_module().release_active_job(
+                identity, selected_job_id, reservation_id
+            )
+        raise
     runner_log.close()
-    meta["worker_pid"] = worker.pid
-    write_json(path / "meta.json", meta)
+    # A fast worker may already have published its terminal state. Merge the
+    # worker PID under the job record lock without resurrecting a released
+    # reservation or overwriting newer evidence.
+    merge_launch_worker_pid(path, meta, worker.pid)
+    b1_module().register_job_process(
+        identity,
+        selected_job_id,
+        "worker",
+        worker.pid,
+        reservation_id=reservation_id,
+    )
     output = {
         "job_id": selected_job_id,
         "agent": args.cli,
@@ -3128,10 +3761,68 @@ def terminate_process_group(pid: int, force: bool = False) -> None:
         pass
 
 
+def worker_job_identity(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve the reservation identity for a worker without failing the job."""
+    workspace = meta.get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        return None
+    try:
+        return canonical_workspace(Path(workspace))
+    except (RunnerError, OSError):
+        return None
+
+
 def command_worker(args: argparse.Namespace) -> int:
     path = Path(args.job_dir).resolve()
     meta_path = path / "meta.json"
     meta = read_json(meta_path)
+    job_identity = worker_job_identity(meta)
+    # The launcher's ownership token is carried in meta.json. A worker started
+    # for a job admitted by an older runner (no token) creates one valid
+    # reservation of its own; a restarted worker reuses the token and therefore
+    # preserves the provider occupancy recorded by the previous worker.
+    reservation_id = b1_module().register_job_process(
+        job_identity,
+        meta.get("job_id"),
+        "worker",
+        os.getpid(),
+        reservation_id=meta.get("reservation_id"),
+        job_dir=path,
+    )
+    if reservation_id and meta.get("reservation_id") != reservation_id:
+        # A job admitted by an older runner had no ownership token. Persist the
+        # one this worker created so a legitimate restart updates the same
+        # record (and preserves any provider occupancy already recorded).
+        meta["reservation_id"] = reservation_id
+        with record_lock(meta_path):
+            meta = merge_job_meta(meta_path, meta)
+    blocked = b1_module().worker_block_reason(meta)
+    if blocked:
+        blocked_at = utc_now()
+        result = {
+            "state": "failed",
+            "started_at": blocked_at,
+            "finished_at": blocked_at,
+            "duration_seconds": 0.0,
+            "exit_code": 2,
+            "timed_out": False,
+            "scope_violations": [],
+            "usage_summary": None,
+            "blocked_reason": blocked,
+        }
+        with record_lock(meta_path):
+            write_json(path / "result.json", result)
+            # AG-R3-002: merge the terminal blocked result into this in-memory
+            # record before merging with the latest durable meta. Otherwise the
+            # older state/fields in ``latest`` would overwrite ``meta`` and the
+            # durable record would disagree with result.json.
+            meta.update(result)
+            meta = merge_job_meta(meta_path, meta)
+        add_event(path, "worker_blocked", reason=blocked)
+        b1_module().release_active_job(
+            job_identity, meta.get("job_id"), reservation_id
+        )
+        raise RunnerError(blocked)
     prompt_file = path / "task.md"
     profile = validate_profile(meta["agent"], meta["profile"])
     workspace = Path(meta["workspace"])
@@ -3191,6 +3882,13 @@ def command_worker(args: argparse.Namespace) -> int:
                     start_new_session=True,
                     close_fds=True,
                 )
+                b1_module().register_job_process(
+                    job_identity,
+                    meta.get("job_id"),
+                    "provider",
+                    child.pid,
+                    reservation_id=reservation_id,
+                )
                 meta.update(
                     {
                         "state": "running",
@@ -3198,7 +3896,8 @@ def command_worker(args: argparse.Namespace) -> int:
                         "child_pid": child.pid,
                     }
                 )
-                write_json(meta_path, meta)
+                with record_lock(meta_path):
+                    meta = merge_job_meta(meta_path, meta)
                 add_event(path, "agent_started", child_pid=child.pid)
                 deadline = time.monotonic() + meta["timeout_seconds"]
                 while child.poll() is None and time.monotonic() < deadline:
@@ -3268,15 +3967,19 @@ def command_worker(args: argparse.Namespace) -> int:
         "scope_violations": violated_scope,
         "usage_summary": reported_usage,
     }
-    write_json(path / "result.json", result)
     meta.update(result)
-    write_json(meta_path, meta)
+    with record_lock(meta_path):
+        write_json(path / "result.json", result)
+        meta = merge_job_meta(meta_path, meta)
     add_event(path, "agent_finished", state=state, exit_code=exit_code)
     if meta.get("notify"):
         suffix = "; review required" if state == "succeeded" else ""
         notify_user(
             "Agent Orchestrator", f"Job {meta['job_id']} finished: {state}{suffix}"
         )
+    b1_module().release_active_job(
+        job_identity, meta.get("job_id"), reservation_id
+    )
     return 0 if state == "succeeded" else 1
 
 
@@ -3449,6 +4152,7 @@ def update_plan_after_review(meta: dict[str, Any], review: dict[str, Any]) -> No
     if not plan_id or not item_id:
         return
     path, plan = read_plan(plan_id)
+    b1_module().require_legacy_plan_mutable(plan)
     matching = [item for item in plan.get("items", []) if item.get("id") == item_id]
     if not matching:
         raise RunnerError(f"Plan {plan_id} no longer contains checklist item {item_id}")
@@ -3479,6 +4183,9 @@ def update_plan_after_review(meta: dict[str, Any], review: dict[str, Any]) -> No
 def command_record_review(args: argparse.Namespace) -> int:
     path = job_dir(args.job_id)
     meta = read_json(path / "meta.json")
+    if meta.get("plan_id"):
+        _, linked_plan = read_plan(meta["plan_id"])
+        b1_module().require_legacy_plan_mutable(linked_plan)
     status = get_status(path)
     if status.get("execution_state") != "succeeded":
         raise RunnerError(
@@ -3921,6 +4628,27 @@ def build_parser() -> argparse.ArgumentParser:
     create_plan.add_argument("--title", required=True)
     create_plan.add_argument("--plan-id")
     create_plan.add_argument(
+        "--research-team",
+        action="store_true",
+        help=(
+            "Enroll this checkout in the B1 durable consensus policy. Requires project "
+            "workspace mode and a structured --manifest-file; ordinary plans are unchanged."
+        ),
+    )
+    create_plan.add_argument(
+        "--manifest-file",
+        help="Structured step manifest JSON; required with --research-team",
+    )
+    create_plan.add_argument(
+        "--policy-version",
+        type=int,
+        default=2,
+        help=(
+            "Research policy version for --research-team manifests (default: 2, the "
+            "fixed Codex/DeepSeek/GLM team). Version 1 is historical read-only."
+        ),
+    )
+    create_plan.add_argument(
         "--strategy",
         choices=STRATEGIES,
         default="cost-first",
@@ -3987,6 +4715,99 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("plan_id")
     checkpoint.add_argument("--json", action="store_true")
     checkpoint.set_defaults(func=command_plan_checkpoint)
+
+    consensus_submit = subparsers.add_parser(
+        "consensus-submit",
+        help="Record a round 1 proposal or round 2 cross-examination receipt",
+    )
+    consensus_submit.add_argument("--plan-id", required=True)
+    consensus_submit.add_argument("--step-id", required=True)
+    consensus_submit.add_argument(
+        "--role", required=True, choices=("codex", "antigravity", "deepseek", "glm")
+    )
+    consensus_submit.add_argument(
+        "--round", dest="round_number", type=int, choices=(1, 2), required=True
+    )
+    consensus_submit.add_argument("--submission-file", required=True)
+    consensus_submit.add_argument("--job-id")
+    consensus_submit.add_argument("--leader")
+    consensus_submit.add_argument("--retry-id")
+    consensus_submit.add_argument("--operation-id")
+    consensus_submit.add_argument("--json", action="store_true")
+    consensus_submit.set_defaults(func=command_consensus_submit)
+
+    consensus_freeze = subparsers.add_parser(
+        "consensus-freeze", help="Freeze the candidate that opens round 3"
+    )
+    consensus_freeze.add_argument("--plan-id", required=True)
+    consensus_freeze.add_argument("--step-id", required=True)
+    consensus_freeze.add_argument("--candidate-file", required=True)
+    consensus_freeze.add_argument("--operation-id")
+    consensus_freeze.add_argument("--json", action="store_true")
+    consensus_freeze.set_defaults(func=command_consensus_freeze)
+
+    consensus_vote = subparsers.add_parser(
+        "consensus-vote", help="Record one explicit ballot against the frozen digest"
+    )
+    consensus_vote.add_argument("--plan-id", required=True)
+    consensus_vote.add_argument("--step-id", required=True)
+    consensus_vote.add_argument(
+        "--role", required=True, choices=("codex", "antigravity", "deepseek", "glm")
+    )
+    consensus_vote.add_argument("--digest", required=True)
+    consensus_vote.add_argument(
+        "--vote", required=True, choices=("AGREE", "DISAGREE", "NEEDS_DISCUSSION")
+    )
+    consensus_vote.add_argument("--rationale")
+    consensus_vote.add_argument("--job-id")
+    consensus_vote.add_argument("--leader")
+    consensus_vote.add_argument("--retry-id")
+    consensus_vote.add_argument("--operation-id")
+    consensus_vote.add_argument("--json", action="store_true")
+    consensus_vote.set_defaults(func=command_consensus_vote)
+
+    consensus_pause = subparsers.add_parser(
+        "consensus-pause",
+        help="Pause a missing provider slot and record operator retry guidance",
+    )
+    consensus_pause.add_argument("--plan-id", required=True)
+    consensus_pause.add_argument("--step-id", required=True)
+    consensus_pause.add_argument(
+        "--role", required=True, choices=("codex", "antigravity", "deepseek", "glm")
+    )
+    consensus_pause.add_argument("--reason", required=True)
+    consensus_pause.add_argument("--guidance", required=True)
+    consensus_pause.add_argument("--job-id")
+    consensus_pause.add_argument("--leader")
+    consensus_pause.add_argument("--operation-id")
+    consensus_pause.add_argument("--json", action="store_true")
+    consensus_pause.set_defaults(func=command_consensus_pause)
+
+    consensus_resume = subparsers.add_parser(
+        "consensus-resume", help="Clear a recorded provider pause for an exact retry"
+    )
+    consensus_resume.add_argument("--plan-id", required=True)
+    consensus_resume.add_argument("--step-id", required=True)
+    consensus_resume.add_argument(
+        "--role", required=True, choices=("codex", "antigravity", "deepseek", "glm")
+    )
+    consensus_resume.add_argument("--retry-id", required=True)
+    consensus_resume.add_argument("--operation-id")
+    consensus_resume.add_argument("--json", action="store_true")
+    consensus_resume.set_defaults(func=command_consensus_resume)
+
+    consensus_new_cycle = subparsers.add_parser(
+        "consensus-new-cycle",
+        help="Open a fresh cycle after an explicit human authorization",
+    )
+    consensus_new_cycle.add_argument("--plan-id", required=True)
+    consensus_new_cycle.add_argument("--step-id", required=True)
+    consensus_new_cycle.add_argument("--authorized-by", required=True)
+    consensus_new_cycle.add_argument("--authorization")
+    consensus_new_cycle.add_argument("--authorization-file")
+    consensus_new_cycle.add_argument("--operation-id")
+    consensus_new_cycle.add_argument("--json", action="store_true")
+    consensus_new_cycle.set_defaults(func=command_consensus_new_cycle)
 
     metrics = subparsers.add_parser(
         "metrics", help="Aggregate recent executor outcomes and provider-reported usage"
