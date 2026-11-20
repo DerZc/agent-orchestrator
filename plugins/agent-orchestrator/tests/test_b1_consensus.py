@@ -2081,48 +2081,67 @@ class B1ConsensusTests(unittest.TestCase):
     def test_identical_job_ids_in_independent_state_homes_keep_separate_reservations(
         self,
     ) -> None:
-        """C1-R2: one launch's release must never free another launch's writer."""
+        """B2: one repository lease serializes writers across state homes.
+
+        The B1 ownership token remains unique per admitted launch, but two
+        writers may no longer hold the same checkout at once: the second state
+        home is refused by the stable repository writer lease even when it uses
+        the same job ID.  After the first supervisor proves completion, the
+        second state home acquires a fresh epoch/token and releases only its
+        own record.
+        """
         env_b = self.alternate_env("state-two")
         env_c = self.alternate_env("state-three")
         ready_long = self.root / "ready-long"
         ready_short = self.root / "ready-short"
         self.launch_sleepy(self.env, "long-job", 10, "same-job", ready_long)
-        time.sleep(0.3)
-        self.launch_sleepy(env_b, "short-job", 2, "same-job", ready_short)
         long_pid = int(self.wait_for_file(ready_long))
-        short_pid = int(self.wait_for_file(ready_short))
         self.addCleanup(self.kill_pid, long_pid)
-        self.addCleanup(self.kill_pid, short_pid)
 
         records = sorted(self.reservation_dir().glob("same-job.*.json"))
-        self.assertEqual(len(records), 2, records)
-        tokens = {json.loads(path.read_text())["reservation_id"] for path in records}
-        self.assertEqual(len(tokens), 2)
-        self.assertNotEqual(records[0].name, records[1].name)
+        self.assertEqual(len(records), 1, records)
+        first_token = json.loads(records[0].read_text())["reservation_id"]
 
-        # Wait for the short job to finish and release only its own record.
-        self.wait_for_file(
-            self.root / "state-two" / "jobs" / "same-job" / "result.json"
+        # A second writer through another state home is refused before it can
+        # publish a competing reservation; the override flag cannot bypass it.
+        denied = self.launch_sleepy(
+            env_b, "short-job", 2, "same-job", ready_short, expected=2
         )
-        self.wait_until(
-            lambda: len(list(self.reservation_dir().glob("same-job.*.json"))) == 1
+        self.assertIn("writer lease", denied.stderr)
+        self.assertEqual(
+            len(list(self.reservation_dir().glob("same-job.*.json"))), 1
         )
-        remaining = list(self.reservation_dir().glob("same-job.*.json"))[0]
-        self.assertEqual(json.loads(remaining.read_text())["job_id"], "same-job")
-        # The long provider still runs and must keep the checkout reserved.
-        os.kill(long_pid, 0)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(short_pid, 0)
 
         self.project_mode(env_c)
-        denied = self.run_cli(*self.create_managed_args(), expected=2, env=env_c)
-        self.assertIn("active job", denied.stderr)
-        self.assertIn("same-job", denied.stderr)
+        blocked = self.run_cli(*self.create_managed_args(), expected=2, env=env_c)
+        self.assertTrue(
+            "lease" in blocked.stderr.lower()
+            or "active job" in blocked.stderr.lower(),
+            blocked.stderr,
+        )
         self.assertFalse((self.root / "state-three" / "plans" / "b1-plan").exists())
 
-        # Once the long job has also exited, the third state home can enroll.
+        # True process termination drains the supervisor, writes completion and
+        # releases the record. A sequential launch from the other state home
+        # then gets a distinct ownership token.
+        os.kill(long_pid, signal.SIGTERM)
         self.wait_for_file(self.state / "jobs" / "same-job" / "result.json", timeout=45)
         self.wait_until(lambda: not any(self.reservation_dir().glob("same-job.*.json")))
+
+        self.launch_sleepy(env_b, "short-job", 2, "same-job", ready_short)
+        short_pid = int(self.wait_for_file(ready_short))
+        self.addCleanup(self.kill_pid, short_pid)
+        records = sorted(self.reservation_dir().glob("same-job.*.json"))
+        self.assertEqual(len(records), 1, records)
+        second_token = json.loads(records[0].read_text())["reservation_id"]
+        self.assertNotEqual(first_token, second_token)
+        os.kill(short_pid, signal.SIGTERM)
+        self.wait_for_file(
+            self.root / "state-two" / "jobs" / "same-job" / "result.json", timeout=45
+        )
+        self.wait_until(lambda: not any(self.reservation_dir().glob("same-job.*.json")))
+
+        # With every writer drained, the third state home can enroll.
         created = self.create_managed(env=env_c)
         self.assertFalse(created["idempotent"])
 
@@ -2357,10 +2376,16 @@ class B1ConsensusTests(unittest.TestCase):
         runner.validate_cli_args(args)
         job = self.state / "jobs" / "fast-job"
 
-        def fast_worker(argv, **kwargs):
+        def fast_supervisor(argv, **kwargs):
             job_dir = Path(argv[argv.index("--job-dir") + 1])
+            descriptor = int(argv[argv.index("--lock-fd") + 1])
+            epoch = argv[argv.index("--epoch") + 1]
             meta = runner.read_json(job_dir / "meta.json")
             identity = runner.canonical_workspace(Path(meta["workspace"]))
+            b2 = runner.b2_module()
+            # Adopt the inherited locked descriptor exactly like the real
+            # supervisor, then prove completion before releasing.
+            b2.supervisor_attach(descriptor, epoch, job_dir)
             result = {
                 "state": "succeeded",
                 "started_at": runner.utc_now(),
@@ -2378,6 +2403,17 @@ class B1ConsensusTests(unittest.TestCase):
             runner.b1_module().release_active_job(
                 identity, meta["job_id"], meta["reservation_id"]
             )
+            b2.mark_lease_completed(
+                identity,
+                epoch,
+                job_id=meta["job_id"],
+                final_check={
+                    "state": "clean",
+                    "violations": [],
+                    "evidence": str(job_dir / "final-check.json"),
+                    "finished_at": runner.utc_now(),
+                },
+            )
             return type("FakeProcess", (), {"pid": os.getpid()})()
 
         real_popen = subprocess.Popen
@@ -2386,7 +2422,7 @@ class B1ConsensusTests(unittest.TestCase):
             # ``subprocess.run`` also goes through Popen; only replace the
             # detached worker spawn under test.
             if isinstance(argv, (list, tuple)) and "--job-dir" in argv:
-                return fast_worker(argv, **kwargs)
+                return fast_supervisor(argv, **kwargs)
             return real_popen(argv, *args, **kwargs)
 
         with mock.patch.dict(
