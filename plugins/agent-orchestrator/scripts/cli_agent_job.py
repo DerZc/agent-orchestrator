@@ -468,6 +468,37 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "model_args": ["--model", "{model}"],
         "discover_models_argv": ["cursor-agent", "--list-models"],
     },
+    "deepseek": {
+        "display_name": "DeepSeek Claude Code wrapper",
+        "description": (
+            "Invoke the user's configured deepseek Bash function through its real "
+            "interactive startup context. Discussion operations are read-only; "
+            "implementation/repair are the only workspace-write capability."
+        ),
+        "maturity": "preview",
+        "install_hint": (
+            "Define a static deepseek() Bash function in the configured startup context; "
+            "the function must export literal values and end with claude \"$@\"."
+        ),
+        "argv": ["deepseek"],
+        "prompt_transport": "stdin",
+        "provider": "deepseek",
+    },
+    "glm": {
+        "display_name": "GLM Claude Code wrapper",
+        "description": (
+            "Invoke the user's configured glm Bash function through its real "
+            "interactive startup context. GLM is read-only for every operation."
+        ),
+        "maturity": "preview",
+        "install_hint": (
+            "Define a static glm() Bash function in the configured startup context; "
+            "the function must export literal values and end with claude \"$@\"."
+        ),
+        "argv": ["glm"],
+        "prompt_transport": "stdin",
+        "provider": "glm",
+    },
 }
 
 
@@ -1003,6 +1034,8 @@ def validate_profile(name: str, raw: Any) -> dict[str, Any]:
         "docs_url",
         "install_hint",
         "executable_candidates",
+        "provider",
+        "provider_rcfile",
     }
     unknown_keys = sorted(set(raw) - allowed_keys)
     if unknown_keys:
@@ -1068,11 +1101,29 @@ def validate_profile(name: str, raw: Any) -> dict[str, Any]:
         raise RunnerError(f"File profile {name!r} must use {{prompt_file}}")
     if profile["prompt_transport"] == "arg" and "prompt_text" not in placeholders:
         raise RunnerError(f"Arg profile {name!r} must use {{prompt_text}}")
+    if "provider" in raw:
+        profile["provider"] = raw["provider"]
+    if "provider_rcfile" in raw:
+        profile["provider_rcfile"] = raw["provider_rcfile"]
+    if name in c_module().PROVIDERS or "provider" in raw:
+        try:
+            c_module().validate_reserved_profile(name, raw)
+        except ValueError as exc:
+            raise RunnerError(str(exc)) from exc
     return profile
 
 
 def resolve_profile_executable(profile: dict[str, Any]) -> tuple[str, str | None]:
-    """Return the requested executable name and first installed candidate, if any."""
+    """Return the requested executable name and first installed candidate, if any.
+
+    Reserved named providers are Bash functions, never PATH executables.  Their
+    availability probe runs the configured interactive context and discards all
+    startup output.
+    """
+    provider = profile.get("provider")
+    if c_module().is_reserved_provider(provider):
+        available, _reason = c_module().probe_provider(profile)
+        return str(provider), f"bash-function:{provider}" if available else None
     candidates = profile.get("executable_candidates", [profile["argv"][0]])
     for candidate in candidates:
         found = shutil.which(candidate)
@@ -1091,7 +1142,24 @@ def load_profiles(custom_path: Path | None) -> dict[str, dict[str, Any]]:
         if not isinstance(agents, dict):
             raise RunnerError(f"{custom_path} must contain an 'agents' object")
         for name, raw in agents.items():
-            profiles[name] = validate_profile(name, raw)
+            if c_module().is_reserved_provider(name):
+                if not isinstance(raw, dict):
+                    raise RunnerError(
+                        f"Reserved provider profile {name!r} must be a JSON object"
+                    )
+                overrides = sorted(set(raw) - {"provider_rcfile"})
+                if overrides:
+                    raise RunnerError(
+                        f"Reserved provider profile {name!r} accepts only "
+                        "provider_rcfile overrides; fixed invocation and capability "
+                        "fields cannot be changed: " + ", ".join(overrides)
+                    )
+                merged = dict(BUILTIN_PROFILES[name])
+                if "provider_rcfile" in raw:
+                    merged["provider_rcfile"] = raw["provider_rcfile"]
+                profiles[name] = validate_profile(name, merged)
+            else:
+                profiles[name] = validate_profile(name, raw)
     return profiles
 
 
@@ -1831,6 +1899,26 @@ def plan_dir(plan_id: str, must_exist: bool = True) -> Path:
     if must_exist and not path.is_dir():
         raise RunnerError(f"Unknown plan ID: {plan_id}")
     return path
+
+
+_C_MODULE: Any = None
+
+
+def c_module():
+    """Load the sibling named-provider module by absolute path."""
+    global _C_MODULE
+    if _C_MODULE is None:
+        module_path = Path(__file__).resolve().with_name("c_providers.py")
+        spec = importlib.util.spec_from_file_location(
+            "agent_orchestrator_c_providers", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RunnerError(f"Cannot load named provider module: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _C_MODULE = module
+    return _C_MODULE
 
 
 _B1_MODULE: Any = None
@@ -3065,6 +3153,24 @@ def command_profiles(args: argparse.Namespace) -> int:
             "supports_reasoning_effort": "reasoning_effort_args" in profile,
             "can_discover_models": "discover_models_argv" in profile,
             "can_discover_cli_agents": "discover_cli_agents_argv" in profile,
+            **(
+                {
+                    "provider": profile["provider"],
+                    "provider_startup": (
+                        "explicit_rcfile"
+                        if profile.get("provider_rcfile")
+                        else "default_rc"
+                    ),
+                    "provider_operations": sorted(
+                        c_module().CAPABILITY_TABLE["providers"][profile["provider"]]
+                    ),
+                    "provider_capabilities": c_module().CAPABILITY_TABLE[
+                        "providers"
+                    ][profile["provider"]],
+                }
+                if profile.get("provider")
+                else {}
+            ),
         }
         for name, profile in sorted(profiles.items())
     }
@@ -3531,6 +3637,75 @@ def discover_repository_writer_conflicts(identity: dict[str, Any]) -> list[str]:
     return sorted(set(conflicts))
 
 
+def repository_job_capabilities(
+    identity: dict[str, Any],
+) -> list[tuple[str, str, str | None]]:
+    """Return live jobs in this repository with their typed provider capability.
+
+    Reservation job directories make this visible across state homes.  An
+    unreadable record is reported as ``unknown`` so admission fails closed
+    instead of assuming a reader is safe.
+    """
+    entries: list[tuple[str, str, str | None]] = []
+    seen: set[str] = set()
+    root = identity.get("root")
+    if not isinstance(root, str) or not root:
+        return entries
+
+    def add(job_id: Any, path: Path, reason: str | None = None) -> None:
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        if reason:
+            entries.append((str(job_id), "unknown", reason))
+            return
+        try:
+            meta = read_json(path / "meta.json")
+        except RunnerError:
+            entries.append((str(job_id), "unknown", "job record unavailable"))
+            return
+        if meta.get("job_id") not in {None, job_id}:
+            entries.append((str(job_id), "unknown", "job record identity mismatch"))
+            return
+        entries.append(
+            (str(job_id), c_module().classify_job_capability(meta), None)
+        )
+
+    for job_id in active_jobs_for_canonical_workspace(root):
+        try:
+            path = job_dir(str(job_id))
+        except RunnerError:
+            entries.append((str(job_id), "unknown", "job directory unavailable"))
+            continue
+        add(job_id, path)
+    for record in b1_module().active_repository_reservations(identity):
+        job_id = record.get("job_id")
+        job_dir_value = record.get("job_dir")
+        if not isinstance(job_dir_value, str) or not job_dir_value:
+            entries.append((str(job_id), "unknown", "job directory unavailable"))
+            continue
+        add(job_id, Path(job_dir_value))
+    return entries
+
+
+def provider_admission_conflicts(
+    identity: dict[str, Any], target_capability: str
+) -> list[str]:
+    """List live jobs incompatible with the target provider capability."""
+    conflicts: list[str] = []
+    for job_id, capability, reason in repository_job_capabilities(identity):
+        if target_capability == "readonly":
+            if capability != "readonly":
+                detail = reason or capability
+                conflicts.append(f"{job_id} ({detail})")
+        elif capability == "readonly":
+            # Unknown/writer records keep the existing discoverable-writer
+            # diagnostics from discover_repository_writer_conflicts().
+            conflicts.append(f"{job_id} (readonly)")
+    return sorted(set(conflicts))
+
+
 def active_jobs_for_canonical_workspace(root: str) -> list[str]:
     """Return active jobs in one canonical Git checkout, including subdirectories.
 
@@ -3762,11 +3937,70 @@ def command_launch(args: argparse.Namespace) -> int:
     if args.cli not in profiles:
         raise RunnerError(f"Unknown CLI profile: {args.cli}")
     profile = profiles[args.cli]
-    executable, found = resolve_profile_executable(profile)
-    if not found:
-        candidates = ", ".join(profile.get("executable_candidates", [executable]))
-        hint = f" {profile['install_hint']}" if profile.get("install_hint") else ""
-        raise RunnerError(f"Executable not found on PATH (tried: {candidates}).{hint}")
+    reserved_provider = c_module().is_reserved_provider(profile.get("provider"))
+    provider_binding: dict[str, Any] | None = None
+    if reserved_provider:
+        if not args.operation:
+            raise RunnerError(
+                "Reserved provider profiles require an explicit --operation; task text "
+                "and role labels are never used to infer capability"
+            )
+        forbidden: list[str] = []
+        for requested, label in (
+            (args.model, "--model"),
+            (args.cli_agent, "--cli-agent"),
+            (args.max_turns, "--max-turns"),
+            (args.max_cost_usd, "--max-cost-usd"),
+            (args.reasoning_effort, "--reasoning-effort"),
+            (args.use_terra_fallback, "--use-terra-fallback"),
+            (args.feedback_id, "--feedback-id"),
+            (args.allow_concurrent_workspace, "--allow-concurrent-workspace"),
+        ):
+            if requested:
+                forbidden.append(label)
+        if forbidden:
+            raise RunnerError(
+                "Reserved provider profiles do not accept widening invocation flags: "
+                + ", ".join(forbidden)
+            )
+        try:
+            provider_binding = c_module().build_binding(
+                args.cli, profile, args.operation
+            )
+        except c_module().ProviderError as exc:
+            raise RunnerError(f"{exc.code}: {exc.message}") from exc
+        resolved_rcfile = provider_binding["wrapper"].get("rcfile")
+        if resolved_rcfile:
+            profile = dict(profile)
+            profile["provider_rcfile"] = resolved_rcfile
+        available, reason = c_module().probe_provider(profile)
+        if not available:
+            raise RunnerError(
+                f"provider_unavailable: {reason or 'reserved provider is unavailable'}"
+            )
+        isolation_ok, isolation_reason = c_module().isolation_status()
+        if not isolation_ok:
+            raise RunnerError(
+                "isolation_unavailable: "
+                + (isolation_reason or c_module().SAFE_ISOLATION_ERROR)
+            )
+    else:
+        if args.operation:
+            raise RunnerError(
+                "--operation is only valid for the reserved deepseek/glm provider "
+                "profiles; legacy adapters never gain named-provider capability"
+            )
+        executable, found = resolve_profile_executable(profile)
+        if not found:
+            candidates = ", ".join(
+                profile.get("executable_candidates", [executable])
+            )
+            hint = (
+                f" {profile['install_hint']}" if profile.get("install_hint") else ""
+            )
+            raise RunnerError(
+                f"Executable not found on PATH (tried: {candidates}).{hint}"
+            )
     if bool(args.plan_id) != bool(args.checklist_item):
         raise RunnerError("--plan-id and --checklist-item must be supplied together")
     plan: dict[str, Any] | None = None
@@ -3832,21 +4066,63 @@ def command_launch(args: argparse.Namespace) -> int:
             "max_changed_files": args.max_changed_files,
         }
         if identity.get("is_git"):
-            # Discoverable live legacy/unleased writers and unreadable durable
-            # lease evidence must be resolved before this launcher publishes a
-            # new admission. B2 jobs with consistent ownership are left to the
-            # exclusive lease acquisition below.
-            conflicts = discover_repository_writer_conflicts(identity)
-            if conflicts:
+            if reserved_provider and not identity.get("is_work_tree"):
                 raise RunnerError(
-                    "Another writer is already active or cannot be proven "
-                    f"finished in {identity.get('root')}: "
-                    + ", ".join(conflicts)
-                    + ". Wait for or cancel it; the repository writer lease "
-                    "refuses to overlap a discoverable legacy/unleased writer, "
-                    "and --allow-concurrent-workspace cannot bypass this check."
+                    "Reserved provider profiles require a canonical Git work tree"
                 )
+            readonly_target = bool(
+                provider_binding
+                and provider_binding.get("capability") == "readonly"
+            )
+            if readonly_target:
+                blocker = lease_blocker(identity)
+                if blocker:
+                    raise RunnerError(
+                        "A readonly provider launch is refused while a repository "
+                        f"writer is live or cannot be proven finished: {blocker}"
+                    )
+                conflicts = provider_admission_conflicts(identity, "readonly")
+                if conflicts:
+                    raise RunnerError(
+                        "A readonly provider launch would overlap a live writer or "
+                        "an unprovable record in "
+                        f"{identity.get('root')}: "
+                        + ", ".join(conflicts)
+                        + ". Wait for or cancel it; readonly jobs never acquire or "
+                        "release the repository writer lease."
+                    )
+            else:
+                readonly_conflicts = provider_admission_conflicts(
+                    identity, "workspace_write"
+                )
+                if readonly_conflicts:
+                    raise RunnerError(
+                        "A writer launch is refused while a readonly provider job is "
+                        f"active in {identity.get('root')}: "
+                        + ", ".join(readonly_conflicts)
+                        + ". Wait for it to finish; readers and writers are "
+                        "serialized across state homes."
+                    )
+                # Discoverable live legacy/unleased writers and unreadable
+                # durable lease evidence must be resolved before this launcher
+                # publishes a new admission. B2 jobs with consistent ownership
+                # are left to the exclusive lease acquisition below.
+                conflicts = discover_repository_writer_conflicts(identity)
+                if conflicts:
+                    raise RunnerError(
+                        "Another writer is already active or cannot be proven "
+                        f"finished in {identity.get('root')}: "
+                        + ", ".join(conflicts)
+                        + ". Wait for or cancel it; the repository writer lease "
+                        "refuses to overlap a discoverable legacy/unleased writer, "
+                        "and --allow-concurrent-workspace cannot bypass this check."
+                    )
         else:
+            if reserved_provider:
+                raise RunnerError(
+                    "Reserved provider profiles require a canonical Git work tree "
+                    "for cross-state-home admission and reservations"
+                )
             # Non-Git legacy directories have no repository lease and keep the
             # state-home-local scan and explicit override semantics.
             active = active_jobs_for_workspace(workspace)
@@ -3863,7 +4139,10 @@ def command_launch(args: argparse.Namespace) -> int:
             # authoritative baseline and branch/dirty validation. A prior
             # writer's changes therefore cannot slip between snapshot and
             # admission, and every baseline belongs to this lease epoch.
-            if identity.get("is_git"):
+            if identity.get("is_git") and not (
+                provider_binding
+                and provider_binding.get("capability") == "readonly"
+            ):
                 lease = b2_module().acquire_writer_lease(
                     identity, selected_job_id, path
                 )
@@ -3899,33 +4178,88 @@ def command_launch(args: argparse.Namespace) -> int:
             shutil.copyfile(task_source, original_task)
             os.chmod(original_task, 0o600)
             channel_path = write_channel_wrapper(path, selected_job_id)
-            task_copy = path / "task.md"
-            task_copy.write_text(
+            scratch_path = path / "scratch"
+            scratch_path.mkdir(mode=0o700)
+            if reserved_provider:
+                try:
+                    c_module().validate_path_layout(
+                        workspace,
+                        path,
+                        scratch_path,
+                        channel_path.parent,
+                        [state_home()],
+                    )
+                except c_module().ProviderError as exc:
+                    raise RunnerError(f"{exc.code}: {exc.message}") from exc
+            prompt_text = (
                 coordination_preamble(channel_path)
-                + original_task.read_text(encoding="utf-8"),
-                encoding="utf-8",
+                + original_task.read_text(encoding="utf-8")
             )
+            if reserved_provider and provider_binding is not None:
+                prompt_text += (
+                    "\n\n"
+                    + c_module().provider_contract(
+                        str(provider_binding["operation"])
+                    )
+                )
+            task_copy = path / "task.md"
+            task_copy.write_text(prompt_text, encoding="utf-8")
             os.chmod(task_copy, 0o600)
             task_sha256 = hashlib.sha256(task_copy.read_bytes()).hexdigest()
-            command, transport = build_command(
-                profile,
-                workspace,
-                task_copy,
-                args.model,
-                args.cli_agent,
-                args.max_turns,
-                args.max_cost_usd,
-                args.reasoning_effort,
-                channel_path.parent,
-            )
-            redacted_command = [
-                (
-                    "<prompt_text>"
-                    if token == task_copy.read_text(encoding="utf-8")
-                    else token
+            provider_invocation: dict[str, Any] | None = None
+            if reserved_provider and provider_binding is not None:
+                provider_arguments = c_module().provider_argv(
+                    str(provider_binding["operation"]),
+                    str(provider_binding["capability"]),
+                    scratch_path,
+                    channel_path.parent,
                 )
-                for token in command
-            ]
+                transport = "stdin"
+                invocation = [c_module().bash_executable()]
+                rcfile = provider_binding["wrapper"].get("rcfile")
+                if rcfile:
+                    invocation.extend(["--rcfile", str(rcfile)])
+                invocation.extend(
+                    [
+                        "-ic",
+                        "<c-provider-wrapper>",
+                        "c-provider",
+                        str(provider_binding["provider"]),
+                        *provider_arguments,
+                    ]
+                )
+                redacted_command = invocation
+                provider_invocation = {
+                    "shell": "bash",
+                    "interactive": True,
+                    "mode": "reserved_wrapper",
+                    "function": provider_binding["provider"],
+                    "rcfile": rcfile,
+                    "operation": provider_binding["operation"],
+                    "capability": provider_binding["capability"],
+                    "argv": provider_arguments,
+                    "prompt_transport": "stdin",
+                }
+            else:
+                command, transport = build_command(
+                    profile,
+                    workspace,
+                    task_copy,
+                    args.model,
+                    args.cli_agent,
+                    args.max_turns,
+                    args.max_cost_usd,
+                    args.reasoning_effort,
+                    channel_path.parent,
+                )
+                redacted_command = [
+                    (
+                        "<prompt_text>"
+                        if token == task_copy.read_text(encoding="utf-8")
+                        else token
+                    )
+                    for token in command
+                ]
             meta = {
                 "job_id": selected_job_id,
                 "agent": args.cli,
@@ -3943,6 +4277,17 @@ def command_launch(args: argparse.Namespace) -> int:
                 "depends_on": args.depends_on,
                 "profile": profile,
                 "prompt_transport": transport,
+                **(
+                    {
+                        "operation": args.operation,
+                        "provider": args.cli,
+                        "provider_binding": provider_binding,
+                        "provider_invocation": provider_invocation,
+                        "provider_scratch": str(scratch_path),
+                    }
+                    if reserved_provider
+                    else {}
+                ),
                 "model": args.model,
                 "route": args.route,
                 "coordinator_model": args.coordinator_model,
@@ -4013,6 +4358,15 @@ def command_launch(args: argparse.Namespace) -> int:
             plan_id=args.plan_id,
             checklist_item=args.checklist_item,
             lease_epoch=lease.epoch if lease is not None else None,
+            **(
+                {
+                    "operation": args.operation,
+                    "provider_capability": provider_binding["capability"],
+                    "provider_binding_sha256": provider_binding["binding_sha256"],
+                }
+                if provider_binding is not None
+                else {}
+            ),
         )
         if args.plan_id:
             bind_plan_item(args.plan_id, args.checklist_item, selected_job_id)
@@ -4169,6 +4523,15 @@ def command_launch(args: argparse.Namespace) -> int:
         "reasoning_effort": args.reasoning_effort,
         "cli_agent": args.cli_agent,
         "review_state": "required",
+        **(
+            {
+                "operation": args.operation,
+                "provider_capability": provider_binding["capability"],
+                "provider_binding_sha256": provider_binding["binding_sha256"],
+            }
+            if provider_binding is not None
+            else {}
+        ),
         "plan_id": args.plan_id,
         "checklist_item": args.checklist_item,
         "executor_approval": selected_executor_approval(
@@ -4214,6 +4577,276 @@ def record_worker_identity(
             return latest
     except (OSError, RunnerError):
         return meta
+
+
+def named_provider_job(meta: dict[str, Any]) -> bool:
+    return bool(
+        c_module().is_reserved_provider(meta.get("agent"))
+        or meta.get("provider_binding") is not None
+    )
+
+
+def provider_fallback_binding(meta: dict[str, Any]) -> dict[str, Any]:
+    raw = meta.get("provider_binding")
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {
+        "binding_version": None,
+        "provider": meta.get("agent"),
+        "profile": meta.get("agent"),
+        "operation": meta.get("operation"),
+        "capability": "unknown",
+        "binding_sha256": None,
+        "capability_table_version": c_module().CAPABILITY_TABLE_VERSION,
+        "capability_table_sha256": c_module().CAPABILITY_TABLE_SHA256,
+    }
+
+
+def write_sanitized_provider_logs(
+    stdout_path: Path, stderr_path: Path, stdout: bytes, stderr: bytes
+) -> None:
+    stdout_path.write_bytes(stdout)
+    stderr_path.write_bytes(stderr)
+    os.chmod(stdout_path, 0o600)
+    os.chmod(stderr_path, 0o600)
+
+
+def run_named_provider_worker(
+    meta_path: Path,
+    path: Path,
+    meta: dict[str, Any],
+    reservation_id: Any,
+    job_identity: dict[str, Any] | None,
+    leased: bool,
+) -> int:
+    """Execute one reserved provider job and persist validated C evidence."""
+    started = time.monotonic()
+    started_at = utc_now()
+    stdout_path = path / "stdout.log"
+    stderr_path = path / "stderr.log"
+    prompt_file = path / "task.md"
+    raw_workspace = meta.get("workspace")
+    workspace = Path(raw_workspace) if isinstance(raw_workspace, str) else Path("")
+    scratch = Path(
+        str(meta.get("provider_scratch") or (path / "scratch"))
+    )
+    channel = path / "channel"
+    binding = provider_fallback_binding(meta)
+    run: Any = None
+    error: Any = None
+    exit_code = 126
+    try:
+        if not isinstance(raw_workspace, str) or not workspace.is_absolute():
+            raise c_module().ProviderError(
+                "execution_failed",
+                "provider workspace is not an absolute path",
+            )
+        try:
+            validate_profile(meta.get("agent"), meta.get("profile"))
+        except RunnerError as exc:
+            raise c_module().ProviderError(
+                "unauthorized_role",
+                "job provider profile is not a valid reserved profile",
+            ) from exc
+        binding = c_module().binding_from_meta(meta)
+        if not workspace.is_dir():
+            raise RunnerError("provider workspace is unavailable")
+        identity = canonical_workspace(workspace)
+        if not identity.get("is_git") or not identity.get("is_work_tree"):
+            raise c_module().ProviderError(
+                "unauthorized_role",
+                "reserved provider jobs require a canonical Git work tree",
+            )
+        admitted_workspace = meta.get("canonical_workspace")
+        if admitted_workspace not in {None, identity.get("root")}:
+            raise c_module().ProviderError(
+                "unauthorized_role",
+                "provider workspace does not match the admitted repository",
+            )
+        git_common = identity.get("git_common_dir")
+        git_common_path = Path(git_common) if isinstance(git_common, str) else None
+        git_dir = workspace / ".git"
+        protected = [state_home(), Path.home() / ".ssh", Path.home() / ".config" / "gh", Path.home() / ".git-credentials"]
+
+        def on_spawn(pid: int) -> None:
+            nonlocal meta
+            b1_module().register_job_process(
+                job_identity,
+                meta.get("job_id"),
+                "provider",
+                pid,
+                reservation_id=reservation_id,
+            )
+            meta.update(
+                {
+                    "state": "running",
+                    "started_at": started_at,
+                    "child_pid": pid,
+                    "provider_pid": pid,
+                    "provider_start": b2_module().process_start_identity(pid),
+                }
+            )
+            with record_lock(meta_path):
+                meta = merge_job_meta(meta_path, meta)
+            add_event(path, "agent_started", child_pid=pid)
+
+        def on_heartbeat(details: dict[str, Any]) -> None:
+            write_json(
+                path / "heartbeat.json",
+                {"at": utc_now(), **details},
+            )
+
+        def on_event(event_type: str, details: dict[str, Any]) -> None:
+            add_event(path, event_type, **details)
+
+        def check_scope() -> list[str]:
+            return scope_violations(
+                workspace, meta.get("git_baseline", {}), meta.get("scope", {})
+            )
+
+        run = c_module().run_provider(
+            profile=meta["profile"],
+            binding=binding,
+            workspace=workspace,
+            job_dir=path,
+            prompt_file=prompt_file,
+            timeout_seconds=float(meta.get("timeout_seconds") or 3600),
+            cancel_marker=path / "cancel-requested",
+            scratch=scratch,
+            channel=channel,
+            protected_paths=protected,
+            git_dir=git_dir if git_dir.exists() else None,
+            git_common_dir=git_common_path,
+            on_spawn=on_spawn,
+            on_heartbeat=on_heartbeat,
+            on_event=on_event,
+            scope_check=check_scope,
+        )
+        exit_code = run.exit_code
+        write_sanitized_provider_logs(
+            stdout_path, stderr_path, run.stdout, run.stderr
+        )
+    except c_module().ProviderError as exc:
+        error = exc
+        if not stdout_path.exists():
+            write_sanitized_provider_logs(stdout_path, stderr_path, b"", b"")
+    except (RunnerError, OSError, ValueError):
+        error = c_module().ProviderError(
+            "execution_failed",
+            "the reserved provider worker could not initialize its evidence",
+        )
+        if not stdout_path.exists():
+            write_sanitized_provider_logs(stdout_path, stderr_path, b"", b"")
+    except Exception:
+        error = c_module().ProviderError(
+            "execution_failed", "the reserved provider worker failed unexpectedly"
+        )
+        if not stdout_path.exists():
+            write_sanitized_provider_logs(stdout_path, stderr_path, b"", b"")
+    if run is not None:
+        raw_result = run.result
+        error = run.error
+        exit_code = run.exit_code
+    else:
+        raw_result = c_module().error_result(
+            binding,
+            error
+            or c_module().ProviderError(
+                "execution_failed", "provider execution did not start"
+            ),
+            exit_code=exit_code,
+        )
+    persistence_error: dict[str, str] | None = None
+    provider_summary: dict[str, Any]
+    try:
+        result_path = c_module().persist_provider_result(
+            path, raw_result, write_json
+        )
+        digest = c_module().provider_result_sha256(raw_result)
+        provider_summary = c_module().provider_result_summary(
+            raw_result, result_path, digest
+        )
+    except (OSError, RunnerError, TypeError, ValueError):
+        persistence_error = {
+            "code": "execution_failed",
+            "message": "the normalized provider result could not be persisted",
+        }
+        provider_summary = {
+            "result_version": c_module().RESULT_VERSION,
+            "provider": binding.get("provider"),
+            "operation": binding.get("operation"),
+            "capability": binding.get("capability"),
+            "validated": False,
+            "error": persistence_error,
+            "binding_sha256": binding.get("binding_sha256"),
+            "capability_table_version": c_module().CAPABILITY_TABLE_VERSION,
+            "capability_table_sha256": c_module().CAPABILITY_TABLE_SHA256,
+            "usage": None,
+            "total_cost_usd": None,
+            "result_path": None,
+            "result_sha256": None,
+        }
+    violated_scope = list(run.scope_violations) if run is not None else []
+    timed_out = bool(run.timed_out) if run is not None else False
+    cancelled = bool(run.cancelled) if run is not None else False
+    if (path / "cancel-requested").exists():
+        cancelled = True
+    if violated_scope:
+        state = "scope_violated"
+    elif timed_out:
+        state = "timed_out"
+    elif cancelled:
+        state = "cancelled"
+    elif (
+        run is not None
+        and exit_code == 0
+        and raw_result.get("validated") is True
+        and persistence_error is None
+    ):
+        state = "succeeded"
+    else:
+        state = "failed"
+    provider_error = (
+        persistence_error
+        if persistence_error is not None
+        else (run.error if run is not None else (error.as_dict() if error else None))
+    )
+    finished_at = utc_now()
+    result = {
+        "state": state,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "scope_violations": violated_scope,
+        "scope_violations_detected": violated_scope,
+        "usage_summary": usage_summary(stdout_path),
+        "provider_result": provider_summary,
+        "provider_error": provider_error,
+    }
+    meta.update(result)
+    with record_lock(meta_path):
+        write_json(path / "result.json", result)
+        meta = merge_job_meta(meta_path, meta)
+    add_event(
+        path,
+        "agent_finished",
+        state=state,
+        exit_code=exit_code,
+        provider_validated=bool(provider_summary.get("validated")),
+        provider_error_code=(provider_error or {}).get("code"),
+    )
+    if meta.get("notify"):
+        notify_user(
+            "Agent Orchestrator",
+            f"Job {meta['job_id']} finished: {state}",
+        )
+    if not leased:
+        b1_module().release_active_job(
+            job_identity, meta.get("job_id"), reservation_id
+        )
+    return 0 if state == "succeeded" else 1
 
 
 def command_worker(args: argparse.Namespace) -> int:
@@ -4281,6 +4914,10 @@ def command_worker(args: argparse.Namespace) -> int:
                 job_identity, meta.get("job_id"), reservation_id
             )
         raise RunnerError(blocked)
+    if named_provider_job(meta):
+        return run_named_provider_worker(
+            meta_path, path, meta, reservation_id, job_identity, leased
+        )
     prompt_file = path / "task.md"
     profile = validate_profile(meta["agent"], meta["profile"])
     workspace = Path(meta["workspace"])
@@ -5501,6 +6138,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     launch = subparsers.add_parser("launch", help="Launch a detached agent job")
     launch.add_argument("--cli", "--agent", dest="cli")
+    launch.add_argument(
+        "--operation",
+        choices=c_module().OPERATIONS,
+        help=(
+            "Explicit C provider operation. Required for the reserved deepseek/glm "
+            "profiles and rejected for ordinary legacy adapters."
+        ),
+    )
     launch.add_argument("--route", choices=tuple(sorted(BUILTIN_ROUTES)))
     launch.add_argument("--coordinator-model")
     launch.add_argument("--workspace", default=os.getcwd())

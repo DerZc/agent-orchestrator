@@ -1,8 +1,39 @@
 # Adapter configuration
 
 Built-in adapters cover Cursor, DeepSeek Harness, Kimi Code, Codex CLI, Claude Code, Devin, Grok,
-Gemini, and OpenCode. Add other headless coding CLIs in `~/.config/agent-orchestrator/agents.json`, or pass
-another file with `--config`.
+Gemini, OpenCode, and the reserved `deepseek`/`glm` Claude Code wrapper profiles. Add other
+headless coding CLIs in `~/.config/agent-orchestrator/agents.json`, or pass another file with
+`--config`.
+
+## Reserved named providers
+
+`deepseek` and `glm` are fixed profiles for the user's installed Claude Code Bash functions.
+They are not ordinary adapter entries: they invoke the function in its real `bash -ic` startup
+context, require an explicit `--operation`, and are confined by bubblewrap. Only the Bash
+startup file may be configured:
+
+```json
+{
+  "agents": {
+    "deepseek": {"provider_rcfile": "/absolute/path/to/deepseek-startup.sh"},
+    "glm": {"provider_rcfile": "/absolute/path/to/glm-startup.sh"}
+  }
+}
+```
+
+Omitting `provider_rcfile` uses the default interactive startup context. Reserved profiles
+reject `argv`, `prompt_transport`, model/agent/turn/cost/effort fields and every other
+capability-bearing override. A legacy adapter cannot gain these rights by claiming a provider
+identity. The native `deepseek-harness` profile remains separate and unchanged.
+
+See [c-provider-adapters.md](c-provider-adapters.md) for the wrapper grammar, capability table,
+isolation policy, result v1 schema, error enum and limits. Named launches use the ordinary
+executor approval flow, for example:
+
+```bash
+python3 <runner> launch --cli deepseek --operation proposal \
+  --approved-executor deepseek --workspace <checkout> --task-file <task.md>
+```
 
 ```json
 {
