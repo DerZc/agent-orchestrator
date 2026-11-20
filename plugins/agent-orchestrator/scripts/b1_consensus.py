@@ -367,6 +367,22 @@ def _fail(message: str) -> None:
     raise _error(message)
 
 
+def _lease_blocker(identity: dict[str, Any]) -> str | None:
+    """Consult the B2 repository writer lease through its optional hook.
+
+    B1 owns enrollment/admission ordering; B2 owns the stable writer lease. The
+    hook is optional so historical B1-only callers still work, and any failure
+    to read lease state fails closed rather than admitting a writer.
+    """
+    hook = _HOOKS.get("lease_blocker")
+    if hook is None:
+        return None
+    try:
+        return hook(identity)
+    except Exception as exc:
+        return f"Repository writer lease state unavailable; failing closed: {exc}"
+
+
 def _now() -> str:
     return _hook("utc_now")()
 
@@ -1012,6 +1028,7 @@ def _process_alive(pid: Any) -> bool:
 
     An unavailable or unreadable `/proc` does not change the result: a process
     that cannot be probed is treated as alive so admission stays fail-closed.
+    An exited-but-unreaped zombie cannot write and is reported as dead.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
@@ -1023,6 +1040,13 @@ def _process_alive(pid: Any) -> bool:
         return True
     except OSError:
         return True
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+        if data.rsplit(b")", 1)[1].split()[0] == b"Z":
+            return False
+    except (OSError, IndexError):
+        # Platforms without /proc keep the conservative os.kill result.
+        pass
     return True
 
 
@@ -1265,12 +1289,14 @@ def release_active_job(
         return
 
 
-def _active_reservations_locked(identity: dict[str, Any]) -> list[str]:
-    """Return live reservations and prune records whose processes are gone."""
+def _active_reservation_records_locked(
+    identity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return live reservation records and prune records whose processes are gone."""
     directory = _reservations_dir(identity)
     if directory is None or not directory.is_dir():
         return []
-    active: list[str] = []
+    active: list[dict[str, Any]] = []
     stale: list[Path] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         if path.name.startswith("."):
@@ -1280,7 +1306,7 @@ def _active_reservations_locked(identity: dict[str, Any]) -> list[str]:
             _fail(f"Unexpected active-job reservation entry: {path}")
         record = _validate_reservation(_read_json(path), identity, path)
         if _reservation_live(record):
-            active.append(record["job_id"])
+            active.append(record)
         else:
             stale.append(path)
     for path in stale:
@@ -1288,6 +1314,29 @@ def _active_reservations_locked(identity: dict[str, Any]) -> list[str]:
     if stale:
         _fsync_dir(directory)
     return active
+
+
+def _active_reservations_locked(identity: dict[str, Any]) -> list[str]:
+    """Return live reservation job IDs and prune dead records."""
+    return [
+        str(record["job_id"])
+        for record in _active_reservation_records_locked(identity)
+    ]
+
+
+def active_repository_reservations(
+    identity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return live repository-local reservations shared across state homes.
+
+    The caller normally holds the admission locks (launch admission does); the
+    repository lock is re-entered safely.  Records whose recorded processes are
+    gone are pruned.  Malformed records fail closed instead of being ignored.
+    """
+    if not identity.get("is_git"):
+        return []
+    with _repo_lock(identity):
+        return _active_reservation_records_locked(identity)
 
 
 def _active_jobs_with_reservations(
@@ -1484,6 +1533,9 @@ def _guard_legacy_creation_locked(identity: dict[str, Any]) -> None:
             f"Workspace {identity['root']} belongs to managed plan {managed}; "
             "enrollment cannot be replaced or duplicated"
         )
+    lease_blocker = _lease_blocker(identity)
+    if lease_blocker:
+        _fail(lease_blocker)
 
 
 def guard_legacy_plan_creation(workspace: Path) -> None:
@@ -1629,6 +1681,11 @@ def launch_admission(
                     f"Plan {plan_id} has a managed consensus ledger; no writer may start "
                     "from it in B1"
                 )
+        # Launch admission itself acquires the B2 repository writer lease inside
+        # this lock via the runner hook, so contention is reported by the atomic
+        # acquire path (with its completion hand-off retry) rather than by a
+        # racy pre-check here. Enrollment paths below have no acquire step and
+        # still consult the lease explicitly.
         yield identity
 
 
@@ -1655,6 +1712,11 @@ def worker_block_reason(meta: dict[str, Any]) -> str | None:
                     f"Workspace {workspace} is enrolled in managed plan "
                     f"{entry['plan_id']}; B1 blocks worker execution in this checkout"
                 )
+        lease_hook = _HOOKS.get("lease_worker_blocker")
+        if lease_hook is not None:
+            lease_block = lease_hook(meta)
+            if lease_block:
+                return str(lease_block)
     except runner_error as exc:
         return f"Admission state unavailable; B1 fails closed: {exc}"
     except (OSError, ValueError) as exc:
@@ -4234,6 +4296,9 @@ def create_managed_plan(
                 "Cannot enroll over an active job in "
                 f"{identity['root']}: {', '.join(active)}. Wait for or cancel it first"
             )
+        lease_blocker = _lease_blocker(identity)
+        if lease_blocker:
+            _fail(lease_blocker)
         # Reconcile an interrupted earlier attempt for this same plan under the
         # repository lock. Only the intent's own staging directory, with the
         # marker or the exact known pre-publication layout, is removed;

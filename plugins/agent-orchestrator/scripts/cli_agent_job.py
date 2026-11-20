@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fnmatch
 import fcntl
 from contextlib import contextmanager
 import hashlib
@@ -1615,46 +1614,23 @@ def build_command(
     return command, profile["prompt_transport"]
 
 
-def git_snapshot(workspace: Path) -> dict[str, Any]:
-    check = subprocess.run(
-        ["git", "-C", str(workspace), "rev-parse", "--is-inside-work-tree"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
+def git_snapshot(
+    workspace: Path,
+    *,
+    strict: bool = False,
+    extra_paths: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Capture the B2 content-attributable Git snapshot.
+
+    ``strict`` refuses an unreadable or unsupported dirty set rather than
+    returning evidence that cannot attest scope safety.  ``extra_paths`` names
+    explicit scope paths (including ignored files) that must be observed even
+    when Git status does not report them.  Read-only observation
+    (``GIT_OPTIONAL_LOCKS=0``) never refreshes or rewrites the index.
+    """
+    return b2_module().snapshot_workspace(
+        workspace, strict=strict, extra_paths=extra_paths
     )
-    if check.returncode != 0 or check.stdout.strip() != "true":
-        return {"is_git": False, "dirty": False}
-    head = subprocess.run(
-        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    status = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(workspace),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    if status.returncode != 0:
-        raise RunnerError(f"Could not inspect git status: {status.stderr.strip()}")
-    lines = status.stdout.splitlines()
-    return {
-        "is_git": True,
-        "head": head.stdout.strip() if head.returncode == 0 else None,
-        "dirty": bool(lines),
-        "status": lines,
-    }
 
 
 def _not_a_git_worktree(literal: Path) -> dict[str, Any]:
@@ -1831,30 +1807,8 @@ def status_paths(status_lines: list[str]) -> set[str]:
 def scope_violations(
     workspace: Path, baseline: dict[str, Any], scope: dict[str, Any]
 ) -> list[str]:
-    if (
-        not scope.get("allowed_paths")
-        and not scope.get("denied_paths")
-        and scope.get("max_changed_files") is None
-    ):
-        return []
-    if not baseline.get("is_git"):
-        return []
-    current = git_snapshot(workspace)
-    changed = status_paths(current.get("status", [])) - status_paths(
-        baseline.get("status", [])
-    )
-    allowed = scope.get("allowed_paths", [])
-    denied = scope.get("denied_paths", [])
-    violations: list[str] = []
-    for path in sorted(changed):
-        if denied and any(fnmatch.fnmatch(path, pattern) for pattern in denied):
-            violations.append(f"denied path changed: {path}")
-        elif allowed and not any(fnmatch.fnmatch(path, pattern) for pattern in allowed):
-            violations.append(f"out-of-scope path changed: {path}")
-    limit = scope.get("max_changed_files")
-    if limit is not None and len(changed) > limit:
-        violations.append(f"changed file count {len(changed)} exceeds limit {limit}")
-    return violations
+    """Content-attributed scope check (B2), with legacy baseline fallback."""
+    return b2_module().scope_violations(workspace, baseline, scope)
 
 
 def make_job_id(agent: str) -> str:
@@ -1910,8 +1864,83 @@ def b1_module():
         utc_now=utc_now,
         canonical_workspace=canonical_workspace,
         active_jobs_for_identity=active_jobs_for_canonical_workspace,
+        lease_blocker=lease_blocker,
+        lease_worker_blocker=worker_lease_block,
     )
     return _B1_MODULE
+
+
+_B2_MODULE: Any = None
+
+
+def b2_module():
+    """Load the sibling B2 lease/integrity module by absolute path."""
+    global _B2_MODULE
+    if _B2_MODULE is None:
+        module_path = Path(__file__).resolve().with_name("b2_workspace.py")
+        spec = importlib.util.spec_from_file_location(
+            "agent_orchestrator_b2_workspace", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RunnerError(f"Cannot load workspace lease module: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _B2_MODULE = module
+    _B2_MODULE.configure(
+        runner_error=RunnerError,
+        state_home=state_home,
+        utc_now=utc_now,
+        read_json=read_json,
+        write_json=write_json,
+        record_lock=record_lock,
+        add_event=add_event,
+        canonical_workspace=canonical_workspace,
+        release_reservation=release_repository_reservation,
+    )
+    return _B2_MODULE
+
+
+def release_repository_reservation(
+    identity: dict[str, Any] | None, job_id: Any, reservation_id: Any
+) -> None:
+    """Release exactly the B1 reservation a supervisor owns."""
+    b1_module().release_active_job(identity, job_id, reservation_id)
+
+
+def lease_blocker(identity: dict[str, Any] | None) -> str | None:
+    return b2_module().lease_blocker(identity)
+
+
+def worker_lease_block(meta: dict[str, Any]) -> str | None:
+    return b2_module().worker_lease_block(meta)
+
+
+def lease_owner_assessment(
+    meta: dict[str, Any], path: Path | None = None
+) -> dict[str, Any]:
+    """Classify one job record's durable lease completion evidence."""
+    try:
+        return b2_module().lease_owner_assessment(meta, path)
+    except Exception as exc:
+        return {
+            "leased": isinstance(meta.get("workspace_lease"), dict),
+            "kind": "unclean",
+            "reason": f"repository lease ownership evidence is unavailable: {exc}",
+        }
+
+
+def completion_evidence(meta: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Report whether a leased job's completion was durably finalized."""
+    try:
+        return b2_module().completion_evidence(meta, path)
+    except Exception as exc:
+        return {
+            "leased": isinstance(meta.get("workspace_lease"), dict),
+            "finalized": False,
+            "kind": "unclean",
+            "reason": f"repository lease completion evidence is unavailable: {exc}",
+        }
 
 
 def plan_items(text: str) -> list[dict[str, Any]]:
@@ -2830,9 +2859,28 @@ def pid_alive(pid: Any) -> bool:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+    # An exited-but-unreaped process cannot write or accept signals.
+    return not _pid_is_zombie(pid)
+
+
+JOB_PROCESS_PID_KEYS = (
+    "worker_pid",
+    "supervisor_pid",
+    "provider_pid",
+    "child_pid",
+)
+
+
+def job_process_alive(meta: dict[str, Any]) -> bool:
+    """Any recorded runner/provider process keeps the job visibly active.
+
+    The B2 supervisor is the durable lifetime anchor: a killed worker with a
+    live provider (or a surviving supervisor) must not make the job look lost
+    while descendants can still write.
+    """
+    return any(pid_alive(meta.get(key)) for key in JOB_PROCESS_PID_KEYS)
 
 
 def usage_summary(log_path: Path) -> dict[str, Any] | None:
@@ -2883,8 +2931,43 @@ def get_status(path: Path) -> dict[str, Any]:
     if result_path.exists():
         result = read_json(result_path)
         status = {**meta, **result}
+        if result.get("state") in TERMINAL_JOB_STATES:
+            # The worker publishes its preliminary result as soon as the direct
+            # provider exits -- success, failure, cancellation, timeout or a
+            # scope violation alike -- but the supervisor has not yet proven
+            # that every adopted descendant drained and has not run the final
+            # integrity check.  Externally visible completion must wait for the
+            # durable per-job receipt/final check and a terminal owner state.
+            # command_wait therefore keeps polling while descendants remain,
+            # and a later finalized status preserves the underlying outcome.
+            completion = completion_evidence(meta, path)
+            if completion.get("leased"):
+                status["completion_finalized"] = bool(
+                    completion.get("finalized")
+                )
+                status["completion_evidence_kind"] = completion.get("kind")
+                if (
+                    completion.get("kind") == "failed_admission"
+                    and result.get("state") == "succeeded"
+                ):
+                    # Contradicting durable evidence: a pre-worker admission
+                    # failure cannot attest a successful run.  Fail closed.
+                    status["completion_finalized"] = False
+                    status["state"] = "lost"
+                    status["completion_blocked"] = (
+                        "the lease owner records a failed admission while the "
+                        "worker result claims success"
+                    )
+                elif not completion.get("finalized"):
+                    status["preliminary_state"] = result.get("state")
+                    status["state"] = (
+                        "running"
+                        if completion.get("kind") == "pending"
+                        else "lost"
+                    )
+                    status["completion_blocked"] = completion.get("reason")
     else:
-        worker_alive = pid_alive(meta.get("worker_pid"))
+        worker_alive = job_process_alive(meta)
         state = (
             "cancelling"
             if (path / "cancel-requested").exists() and worker_alive
@@ -3335,14 +3418,28 @@ def canonical_job_identity(meta: dict[str, Any]) -> str | None:
     return identity.get("root") if identity.get("is_git") else None
 
 
+def _pid_is_zombie(pid: int) -> bool:
+    """Return whether ``pid`` is an already-exited, unreaped process."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return False
+    try:
+        return data.rsplit(b")", 1)[1].split()[0] == b"Z"
+    except IndexError:
+        return False
+
+
 def _job_process_alive(meta: dict[str, Any]) -> bool:
     """Return whether a job meta record still names a live process.
 
     A recorded provider may outlive a killed worker, so every process slot is
     consulted. An unprobeable process is treated as alive so a transient
-    permission failure cannot let enrollment run over a live writer.
+    permission failure cannot let enrollment run over a live writer. A zombie
+    has exited and can no longer write; a recorded start identity rejects a
+    reused PID when the kernel exposes it.
     """
-    for key in ("worker_pid", "provider_pid", "child_pid"):
+    for key in JOB_PROCESS_PID_KEYS:
         pid = meta.get(key)
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             continue
@@ -3352,8 +3449,86 @@ def _job_process_alive(meta: dict[str, Any]) -> bool:
             continue
         except OSError:
             return True
+        start = meta.get(key[: -len("_pid")] + "_start")
+        if isinstance(start, str) and start:
+            current = b2_module().process_start_identity(pid)
+            if current is not None and current != start:
+                # The recorded process exited and the PID was reused.
+                continue
+        if _pid_is_zombie(pid):
+            continue
         return True
     return False
+
+
+def discover_repository_writer_conflicts(identity: dict[str, Any]) -> list[str]:
+    """Return discoverable live legacy/unleased writers blocking admission.
+
+    B2 jobs with readable, consistent durable lease ownership are left to the
+    exclusive writer-lease acquisition path, which reports precise contention
+    or guardian-loss evidence. Everything else that is live -- legacy job
+    metadata with no B2 lease, or lease metadata whose owner evidence is
+    unreadable or inconsistent -- is a conflict: a new repository writer must
+    never silently overlap it. Shared repository reservations make this visible
+    across state homes.
+    """
+    root = identity.get("root")
+    if not isinstance(root, str) or not root:
+        return []
+    def settled(meta: dict[str, Any], path: Path) -> bool:
+        """Return whether this live record can be proven a finished writer."""
+        assessment = lease_owner_assessment(meta, path)
+        if not assessment.get("leased"):
+            return False
+        if assessment.get("kind") in {"active", "terminal"}:
+            # The exclusive acquisition path reports contention or uncertain
+            # ownership with the precise owner/epoch evidence.
+            return True
+        try:
+            # A lingering reservation may name an owner record that has since
+            # been replaced by a later lease epoch. Its own post-drain final
+            # check still proves that this job cannot own the checkout.
+            return bool(b2_module().job_drain_evidence(meta, path))
+        except Exception:
+            return False
+
+    conflicts: list[str] = []
+    for job_id in active_jobs_for_canonical_workspace(root):
+        job_id = str(job_id)
+        try:
+            path = job_dir(job_id)
+            meta = read_json(path / "meta.json")
+        except RunnerError:
+            conflicts.append(f"{job_id} (job record unreadable)")
+            continue
+        if settled(meta, path):
+            continue
+        if not isinstance(meta.get("workspace_lease"), dict):
+            conflicts.append(job_id)
+        else:
+            conflicts.append(f"{job_id} (durable lease evidence is unreadable)")
+    for record in b1_module().active_repository_reservations(identity):
+        job_id = str(record.get("job_id"))
+        job_dir_value = record.get("job_dir")
+        if not isinstance(job_dir_value, str) or not job_dir_value:
+            conflicts.append(f"{job_id} (job record unavailable)")
+            continue
+        path = Path(job_dir_value)
+        try:
+            meta = read_json(path / "meta.json")
+        except RunnerError:
+            conflicts.append(f"{job_id} (job record unavailable)")
+            continue
+        if meta.get("job_id") != job_id:
+            conflicts.append(f"{job_id} (job record identity mismatch)")
+            continue
+        if settled(meta, path):
+            continue
+        if not isinstance(meta.get("workspace_lease"), dict):
+            conflicts.append(job_id)
+        else:
+            conflicts.append(f"{job_id} (durable lease evidence is unreadable)")
+    return sorted(set(conflicts))
 
 
 def active_jobs_for_canonical_workspace(root: str) -> list[str]:
@@ -3447,16 +3622,16 @@ def record_launch_failure(
     add_event(path, "worker_start_failed", error=result["startup_error"])
 
 
-def merge_launch_worker_pid(
-    path: Path, meta: dict[str, Any], worker_pid: int
+def merge_launch_supervisor_pid(
+    path: Path, meta: dict[str, Any], supervisor_pid: int
 ) -> None:
-    """Record the spawned worker without overwriting newer job state.
+    """Record the spawned lease supervisor without overwriting newer state.
 
-    The worker runs concurrently with the launching parent. A terminal result
-    or a state already advanced past ``starting`` is authoritative; the parent
-    only fills in the worker PID while the record is still in its startup
-    window. The job record lock closes the read/write race with the worker's
-    own terminal publication.
+    The supervisor and worker run concurrently with the launching parent. A
+    terminal result or a state already advanced past ``starting`` is
+    authoritative; the parent only fills in the supervisor identity while the
+    record is still in its startup window. The job record lock closes the
+    read/write race with the worker's own terminal publication.
     """
     meta_path = path / "meta.json"
     try:
@@ -3466,12 +3641,92 @@ def merge_launch_worker_pid(
             latest = read_json(meta_path) if meta_path.is_file() else dict(meta)
             if latest.get("state") in TERMINAL_JOB_STATES:
                 return
-            latest["worker_pid"] = worker_pid
+            latest["supervisor_pid"] = supervisor_pid
+            latest["supervisor_start"] = b2_module().process_start_identity(
+                supervisor_pid
+            )
             write_json(meta_path, latest)
     except (OSError, RunnerError):
-        # The admission reservation still names this live worker; failing to
-        # merge the PID delays cleanup but cannot admit another writer.
+        # The admission reservation still names this live supervisor; failing
+        # to merge the PID delays cleanup but cannot admit another writer.
         return
+
+
+def merge_launch_worker_pid(
+    path: Path, meta: dict[str, Any], worker_pid: int
+) -> None:
+    """Record a legacy non-Git worker PID without overwriting newer state."""
+    meta_path = path / "meta.json"
+    try:
+        with record_lock(meta_path):
+            if (path / "result.json").is_file():
+                return
+            latest = read_json(meta_path) if meta_path.is_file() else dict(meta)
+            if latest.get("state") in TERMINAL_JOB_STATES:
+                return
+            latest["worker_pid"] = worker_pid
+            latest["worker_start"] = b2_module().process_start_identity(worker_pid)
+            write_json(meta_path, latest)
+    except (OSError, RunnerError):
+        return
+
+
+def spawn_lease_supervisor(path: Path, lease: Any) -> subprocess.Popen[Any]:
+    """Spawn the B2 supervisor with the launcher's locked descriptor."""
+    runner_log = (path / "runner.log").open("ab", buffering=0)
+    try:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_lease-supervisor",
+                "--job-dir",
+                str(path),
+                "--lock-fd",
+                str(lease.descriptor),
+                "--epoch",
+                lease.epoch,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=runner_log,
+            stderr=runner_log,
+            start_new_session=True,
+            pass_fds=(lease.descriptor,),
+        )
+    finally:
+        runner_log.close()
+
+
+def wait_for_lease_handoff(
+    path: Path, lease: Any, process: subprocess.Popen[Any]
+) -> tuple[str, Any]:
+    """Wait briefly for the supervisor to publish durable ownership.
+
+    ``confirmed`` means the owner record names this epoch in ``supervising`` or
+    ``completed``. ``exited`` means the supervisor process ended first; callers
+    must inspect the owner state before declaring a recoverable failure, because
+    a supervisor killed after publishing supervision leaves uncertainty.
+    """
+    deadline = time.monotonic() + b2_module().lease_handoff_timeout()
+    while True:
+        try:
+            owner = b2_module().read_owner(lease.identity)
+        except RunnerError as exc:
+            return "unreadable", str(exc)
+        if (
+            owner
+            and owner.get("epoch") == lease.epoch
+            and owner.get("state") in {"supervising", "completed"}
+        ):
+            return "confirmed", owner
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            code = poll()
+            if code is not None:
+                return "exited", code
+        if time.monotonic() >= deadline:
+            return "timeout", None
+        time.sleep(0.02)
 
 
 def command_launch(args: argparse.Namespace) -> int:
@@ -3556,179 +3811,351 @@ def command_launch(args: argparse.Namespace) -> int:
         args, plan, plan_item, workspace, task_stats
     )
     validate_dependencies(args.depends_on)
-    active = active_jobs_for_workspace(workspace)
-    if active and not args.allow_concurrent_workspace:
-        raise RunnerError(
-            "Another job is already writing this workspace: "
-            + ", ".join(active)
-            + ". Use a separate worktree or explicitly pass --allow-concurrent-workspace."
-        )
-    snapshot = git_snapshot(workspace)
-    if snapshot["dirty"] and not args.allow_dirty:
-        raise RunnerError(
-            "Workspace has uncommitted changes; use a clean worktree or pass --allow-dirty after recording the baseline"
-        )
     selected_job_id = args.job_id or make_job_id(args.cli)
     path = job_dir(selected_job_id, must_exist=False)
     if path.exists():
         raise RunnerError(f"Job already exists: {selected_job_id}")
     state_home().mkdir(parents=True, exist_ok=True, mode=0o700)
+    lease: Any = None
     # Admission and enrollment share the canonical-identity registry lock. The
-    # job-visible starting record is published before the lock is released so a
-    # concurrent create-plan cannot enroll over this active job.
+    # repository writer lease, the content-attributed baseline, the protected
+    # branch check and the job-visible starting record are all published before
+    # the lock is released, so concurrent enrollment/launch paths observe one
+    # ordering. The supervisor then inherits the locked descriptor and holds it
+    # for the full descendant lifetime.
     with b1_module().launch_admission(workspace, args.plan_id) as identity:
         if path.exists():
             raise RunnerError(f"Job already exists: {selected_job_id}")
-        if fallback_feedback:
-            claim_feedback_for_fallback(fallback_feedback["id"], selected_job_id)
-        jobs_dir().mkdir(exist_ok=True, mode=0o700)
-        path.mkdir(mode=0o700)
-        original_task = path / "task-original.md"
-        shutil.copyfile(task_source, original_task)
-        os.chmod(original_task, 0o600)
-        channel_path = write_channel_wrapper(path, selected_job_id)
-        task_copy = path / "task.md"
-        task_copy.write_text(
-            coordination_preamble(channel_path)
-            + original_task.read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
-        os.chmod(task_copy, 0o600)
-        task_sha256 = hashlib.sha256(task_copy.read_bytes()).hexdigest()
-        command, transport = build_command(
-            profile,
-            workspace,
-            task_copy,
-            args.model,
-            args.cli_agent,
-            args.max_turns,
-            args.max_cost_usd,
-            args.reasoning_effort,
-            channel_path.parent,
-        )
-        redacted_command = [
-            "<prompt_text>" if token == task_copy.read_text(encoding="utf-8") else token
-            for token in command
-        ]
-        meta = {
-            "job_id": selected_job_id,
-            "agent": args.cli,
-            "cli": args.cli,
-            "workspace": str(workspace),
-            "canonical_workspace": (
-                identity.get("root") if identity.get("is_git") else None
-            ),
-            "created_at": utc_now(),
-            "state": "starting",
-            "timeout_seconds": args.timeout_seconds,
-            "notify": args.notify,
-            "group": args.group,
-            "role": args.role,
-            "depends_on": args.depends_on,
-            "profile": profile,
-            "prompt_transport": transport,
-            "model": args.model,
-            "route": args.route,
-            "coordinator_model": args.coordinator_model,
-            "reasoning_effort": args.reasoning_effort,
-            "task_type": (
-                (plan.get("goal") or {}).get("task_type")
-                if plan is not None
-                else "general"
-            ),
-            "cli_agent": args.cli_agent,
-            "max_turns": args.max_turns,
-            "max_cost_usd": args.max_cost_usd,
-            "executor_policy": applied_executor_policy,
-            "terra_fallback_feedback_id": (
-                fallback_feedback.get("id") if fallback_feedback else None
-            ),
-            "task_sha256": task_sha256,
-            "task_stats": task_stats,
-            "context_budget_bytes": route.get("context_budget_bytes") if route else None,
-            "review_required": (
-                route.get("review", {}).get("required", True) if route else True
-            ),
-            "plan_id": args.plan_id,
-            "checklist_item": args.checklist_item,
-            "scope": {
-                "allowed_paths": args.allow_path,
-                "denied_paths": args.deny_path,
-                "max_changed_files": args.max_changed_files,
-            },
-            "git_baseline": snapshot,
-            "command": redacted_command,
-            "channel": str(channel_path),
+        scope_config = {
+            "allowed_paths": args.allow_path,
+            "denied_paths": args.deny_path,
+            "max_changed_files": args.max_changed_files,
         }
-        # Publish the repository-local reservation before releasing admission
-        # locks. Enrollment in any state home consults this record, so a launch
-        # admitted here can never be enrolled over while its processes live.
-        # The returned token names this launch uniquely: identical job IDs
-        # admitted through other state homes keep separate records.
-        reservation_id = b1_module().reserve_active_job(
-            identity, selected_job_id, path, os.getpid()
-        )
-        meta["reservation_id"] = reservation_id
-        write_json(path / "meta.json", meta)
-    add_event(
-        path,
-        "job_created",
-        cli=args.cli,
-        model=args.model,
-        cli_agent=args.cli_agent,
-        group=args.group,
-        role=args.role,
-        depends_on=args.depends_on,
-        task_sha256=task_sha256,
-        workspace=str(workspace),
-        route=args.route,
-        plan_id=args.plan_id,
-        checklist_item=args.checklist_item,
-    )
-    if args.plan_id:
-        bind_plan_item(args.plan_id, args.checklist_item, selected_job_id)
-    runner_log = (path / "runner.log").open("ab", buffering=0)
-    try:
-        worker = subprocess.Popen(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "_worker",
-                "--job-dir",
-                str(path),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=runner_log,
-            stderr=runner_log,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except Exception as exc:
-        runner_log.close()
-        # A failed spawn must not leave a job that looks like it is still
-        # starting: publish the terminal failure, then release only this
-        # launch's reservation.
+        if identity.get("is_git"):
+            # Discoverable live legacy/unleased writers and unreadable durable
+            # lease evidence must be resolved before this launcher publishes a
+            # new admission. B2 jobs with consistent ownership are left to the
+            # exclusive lease acquisition below.
+            conflicts = discover_repository_writer_conflicts(identity)
+            if conflicts:
+                raise RunnerError(
+                    "Another writer is already active or cannot be proven "
+                    f"finished in {identity.get('root')}: "
+                    + ", ".join(conflicts)
+                    + ". Wait for or cancel it; the repository writer lease "
+                    "refuses to overlap a discoverable legacy/unleased writer, "
+                    "and --allow-concurrent-workspace cannot bypass this check."
+                )
+        else:
+            # Non-Git legacy directories have no repository lease and keep the
+            # state-home-local scan and explicit override semantics.
+            active = active_jobs_for_workspace(workspace)
+            if active and not args.allow_concurrent_workspace:
+                raise RunnerError(
+                    "Another job is already writing this workspace: "
+                    + ", ".join(active)
+                    + ". Use a separate worktree or explicitly pass "
+                    "--allow-concurrent-workspace."
+                )
+        protected_policy: dict[str, Any] | None = None
         try:
-            record_launch_failure(
-                path, meta, f"{type(exc).__name__}: {exc}"
+            # B2-C3: the exclusive repository lease is acquired before the
+            # authoritative baseline and branch/dirty validation. A prior
+            # writer's changes therefore cannot slip between snapshot and
+            # admission, and every baseline belongs to this lease epoch.
+            if identity.get("is_git"):
+                lease = b2_module().acquire_writer_lease(
+                    identity, selected_job_id, path
+                )
+            extra_paths = (
+                b2_module().scope_observation_paths(workspace, scope_config)
+                if identity.get("is_git") and identity.get("is_work_tree")
+                else []
             )
-        finally:
-            b1_module().release_active_job(
-                identity, selected_job_id, reservation_id
+            snapshot = git_snapshot(
+                workspace, strict=True, extra_paths=extra_paths
             )
+            if lease is not None:
+                snapshot["lease_epoch"] = lease.epoch
+            if snapshot["dirty"] and not args.allow_dirty:
+                raise RunnerError(
+                    "Workspace has uncommitted changes; use a clean worktree or pass "
+                    "--allow-dirty after recording the baseline"
+                )
+            if args.target_branch or args.protected_branch:
+                protected_policy = b2_module().validate_protected_workspace(
+                    workspace,
+                    target_branch=args.target_branch,
+                    protected_branches=args.protected_branch,
+                    allowed_paths=args.allow_path,
+                    denied_paths=args.deny_path,
+                    snapshot=snapshot,
+                )
+            if fallback_feedback:
+                claim_feedback_for_fallback(fallback_feedback["id"], selected_job_id)
+            jobs_dir().mkdir(exist_ok=True, mode=0o700)
+            path.mkdir(mode=0o700)
+            original_task = path / "task-original.md"
+            shutil.copyfile(task_source, original_task)
+            os.chmod(original_task, 0o600)
+            channel_path = write_channel_wrapper(path, selected_job_id)
+            task_copy = path / "task.md"
+            task_copy.write_text(
+                coordination_preamble(channel_path)
+                + original_task.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            os.chmod(task_copy, 0o600)
+            task_sha256 = hashlib.sha256(task_copy.read_bytes()).hexdigest()
+            command, transport = build_command(
+                profile,
+                workspace,
+                task_copy,
+                args.model,
+                args.cli_agent,
+                args.max_turns,
+                args.max_cost_usd,
+                args.reasoning_effort,
+                channel_path.parent,
+            )
+            redacted_command = [
+                (
+                    "<prompt_text>"
+                    if token == task_copy.read_text(encoding="utf-8")
+                    else token
+                )
+                for token in command
+            ]
+            meta = {
+                "job_id": selected_job_id,
+                "agent": args.cli,
+                "cli": args.cli,
+                "workspace": str(workspace),
+                "canonical_workspace": (
+                    identity.get("root") if identity.get("is_git") else None
+                ),
+                "created_at": utc_now(),
+                "state": "starting",
+                "timeout_seconds": args.timeout_seconds,
+                "notify": args.notify,
+                "group": args.group,
+                "role": args.role,
+                "depends_on": args.depends_on,
+                "profile": profile,
+                "prompt_transport": transport,
+                "model": args.model,
+                "route": args.route,
+                "coordinator_model": args.coordinator_model,
+                "reasoning_effort": args.reasoning_effort,
+                "task_type": (
+                    (plan.get("goal") or {}).get("task_type")
+                    if plan is not None
+                    else "general"
+                ),
+                "cli_agent": args.cli_agent,
+                "max_turns": args.max_turns,
+                "max_cost_usd": args.max_cost_usd,
+                "executor_policy": applied_executor_policy,
+                "terra_fallback_feedback_id": (
+                    fallback_feedback.get("id") if fallback_feedback else None
+                ),
+                "task_sha256": task_sha256,
+                "task_stats": task_stats,
+                "context_budget_bytes": (
+                    route.get("context_budget_bytes") if route else None
+                ),
+                "review_required": (
+                    route.get("review", {}).get("required", True)
+                    if route
+                    else True
+                ),
+                "plan_id": args.plan_id,
+                "checklist_item": args.checklist_item,
+                "scope": {
+                    "allowed_paths": args.allow_path,
+                    "denied_paths": args.deny_path,
+                    "max_changed_files": args.max_changed_files,
+                },
+                "git_baseline": snapshot,
+                "workspace_lease": lease.metadata() if lease is not None else None,
+                "protected_research": protected_policy,
+                "command": redacted_command,
+                "channel": str(channel_path),
+            }
+            # Publish the repository-local reservation before releasing admission
+            # locks. Enrollment in any state home consults this record, so a
+            # launch admitted here can never be enrolled over while its
+            # processes live. The returned token names this launch uniquely:
+            # identical job IDs admitted through other state homes keep
+            # separate records.
+            reservation_id = b1_module().reserve_active_job(
+                identity, selected_job_id, path, os.getpid()
+            )
+            meta["reservation_id"] = reservation_id
+            write_json(path / "meta.json", meta)
+        except BaseException as exc:
+            if lease is not None:
+                lease.abort(f"{type(exc).__name__}: {exc}")
+            raise
+    try:
+        add_event(
+            path,
+            "job_created",
+            cli=args.cli,
+            model=args.model,
+            cli_agent=args.cli_agent,
+            group=args.group,
+            role=args.role,
+            depends_on=args.depends_on,
+            task_sha256=task_sha256,
+            workspace=str(workspace),
+            route=args.route,
+            plan_id=args.plan_id,
+            checklist_item=args.checklist_item,
+            lease_epoch=lease.epoch if lease is not None else None,
+        )
+        if args.plan_id:
+            bind_plan_item(args.plan_id, args.checklist_item, selected_job_id)
+    except BaseException as exc:
+        if lease is not None:
+            # The supervisor has not been spawned yet, so this is a recoverable
+            # pre-dispatch failure; never leave a non-terminal owner record.
+            lease.abort(f"{type(exc).__name__}: {exc}")
+            try:
+                record_launch_failure(path, meta, f"{type(exc).__name__}: {exc}")
+            finally:
+                b1_module().release_active_job(
+                    identity, selected_job_id, reservation_id
+                )
         raise
-    runner_log.close()
-    # A fast worker may already have published its terminal state. Merge the
-    # worker PID under the job record lock without resurrecting a released
-    # reservation or overwriting newer evidence.
-    merge_launch_worker_pid(path, meta, worker.pid)
-    b1_module().register_job_process(
-        identity,
-        selected_job_id,
-        "worker",
-        worker.pid,
-        reservation_id=reservation_id,
-    )
+    if lease is not None:
+        try:
+            process = spawn_lease_supervisor(path, lease)
+        except Exception as exc:
+            # A failed spawn is recoverable: no supervisor ever held the lock.
+            lease.abort(f"{type(exc).__name__}: {exc}")
+            try:
+                record_launch_failure(path, meta, f"{type(exc).__name__}: {exc}")
+            finally:
+                b1_module().release_active_job(
+                    identity, selected_job_id, reservation_id
+                )
+            raise
+        lease.close_parent_copy()
+        handoff, detail = wait_for_lease_handoff(path, lease, process)
+        if handoff == "exited":
+            try:
+                owner = b2_module().read_owner(identity)
+            except RunnerError:
+                owner = None
+            state = owner.get("state") if isinstance(owner, dict) else None
+            if state == "completed":
+                # An exceptionally fast job finished and proved completion
+                # before the launcher observed the hand-off.
+                pass
+            elif state in {"admission", "failed_admission"}:
+                error = (
+                    "lease supervisor exited before publishing ownership "
+                    f"(exit {detail})"
+                )
+                lease.abort(error)
+                try:
+                    record_launch_failure(path, meta, error)
+                finally:
+                    b1_module().release_active_job(
+                        identity, selected_job_id, reservation_id
+                    )
+                raise RunnerError(error)
+            else:
+                # Supervision was published, so a worker/provider descendant
+                # may exist. Never publish a terminal launch failure here: the
+                # non-terminal owner record keeps the repository blocked until
+                # completion is proven or explicitly reconciled.
+                add_event(
+                    path,
+                    "lease_supervisor_lost",
+                    state=state,
+                    exit_code=detail,
+                )
+                raise RunnerError(
+                    "Lease supervisor exited after publishing supervision for "
+                    f"job {selected_job_id}; descendant completion cannot be "
+                    "proven. The repository writer lease remains fail-closed; "
+                    "inspect it with lease-status and use lease-reconcile only "
+                    "after verifying no worker/provider process remains."
+                )
+        elif handoff == "timeout":
+            add_event(
+                path,
+                "lease_handoff_unconfirmed",
+                reason="supervisor did not publish ownership before the timeout",
+                supervisor_pid=process.pid,
+            )
+        elif handoff == "unreadable":
+            add_event(
+                path,
+                "lease_handoff_unconfirmed",
+                reason=str(detail),
+                supervisor_pid=process.pid,
+            )
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
+                raise RunnerError(
+                    "Lease supervisor exited while its ownership record was "
+                    f"unreadable: {detail}. The repository writer lease fails "
+                    "closed; inspect it with lease-status."
+                )
+        # A fast worker may already have published its terminal state. Merge
+        # the supervisor identity under the job record lock without
+        # resurrecting a released reservation or overwriting newer evidence.
+        merge_launch_supervisor_pid(path, meta, process.pid)
+        b1_module().register_job_process(
+            identity,
+            selected_job_id,
+            "worker",
+            process.pid,
+            reservation_id=reservation_id,
+        )
+    else:
+        # Non-Git legacy workspaces have no repository identity to lease and
+        # keep their original detached-worker topology.
+        runner_log = (path / "runner.log").open("ab", buffering=0)
+        try:
+            worker = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_worker",
+                    "--job-dir",
+                    str(path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=runner_log,
+                stderr=runner_log,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception as exc:
+            runner_log.close()
+            # A failed spawn must not leave a job that looks like it is still
+            # starting: publish the terminal failure, then release only this
+            # launch's reservation.
+            try:
+                record_launch_failure(path, meta, f"{type(exc).__name__}: {exc}")
+            finally:
+                b1_module().release_active_job(
+                    identity, selected_job_id, reservation_id
+                )
+            raise
+        runner_log.close()
+        merge_launch_worker_pid(path, meta, worker.pid)
+        b1_module().register_job_process(
+            identity,
+            selected_job_id,
+            "worker",
+            worker.pid,
+            reservation_id=reservation_id,
+        )
     output = {
         "job_id": selected_job_id,
         "agent": args.cli,
@@ -3772,10 +4199,36 @@ def worker_job_identity(meta: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def record_worker_identity(
+    meta_path: Path, meta: dict[str, Any]
+) -> dict[str, Any]:
+    """Publish this worker's pid/start identity for status and recovery."""
+    try:
+        with record_lock(meta_path):
+            latest = read_json(meta_path) if meta_path.is_file() else dict(meta)
+            if (meta_path.parent / "result.json").is_file():
+                return latest
+            latest["worker_pid"] = os.getpid()
+            latest["worker_start"] = b2_module().process_start_identity(os.getpid())
+            write_json(meta_path, latest)
+            return latest
+    except (OSError, RunnerError):
+        return meta
+
+
 def command_worker(args: argparse.Namespace) -> int:
+    # A B2 lease supervisor ignores terminal signals so it can itself drain
+    # adopted descendants; those dispositions must not leak to the worker or
+    # its provider, which keep normal default signal behavior.
+    for name in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(name, signal.SIG_DFL)
+        except (OSError, ValueError):
+            pass
     path = Path(args.job_dir).resolve()
     meta_path = path / "meta.json"
     meta = read_json(meta_path)
+    leased = isinstance(meta.get("workspace_lease"), dict)
     job_identity = worker_job_identity(meta)
     # The launcher's ownership token is carried in meta.json. A worker started
     # for a job admitted by an older runner (no token) creates one valid
@@ -3796,6 +4249,10 @@ def command_worker(args: argparse.Namespace) -> int:
         meta["reservation_id"] = reservation_id
         with record_lock(meta_path):
             meta = merge_job_meta(meta_path, meta)
+    if leased:
+        # The B2 supervisor owns the durable reservation release only after all
+        # descendants have drained and the final integrity check has run.
+        meta = record_worker_identity(meta_path, meta)
     blocked = b1_module().worker_block_reason(meta)
     if blocked:
         blocked_at = utc_now()
@@ -3819,9 +4276,10 @@ def command_worker(args: argparse.Namespace) -> int:
             meta.update(result)
             meta = merge_job_meta(meta_path, meta)
         add_event(path, "worker_blocked", reason=blocked)
-        b1_module().release_active_job(
-            job_identity, meta.get("job_id"), reservation_id
-        )
+        if not leased:
+            b1_module().release_active_job(
+                job_identity, meta.get("job_id"), reservation_id
+            )
         raise RunnerError(blocked)
     prompt_file = path / "task.md"
     profile = validate_profile(meta["agent"], meta["profile"])
@@ -3894,6 +4352,10 @@ def command_worker(args: argparse.Namespace) -> int:
                         "state": "running",
                         "started_at": started_at,
                         "child_pid": child.pid,
+                        "provider_pid": child.pid,
+                        "provider_start": b2_module().process_start_identity(
+                            child.pid
+                        ),
                     }
                 )
                 with record_lock(meta_path):
@@ -3939,6 +4401,21 @@ def command_worker(args: argparse.Namespace) -> int:
             finally:
                 if hasattr(stdin_handle, "close"):
                     stdin_handle.close()
+        # Recheck after the direct provider exited. The supervisor repeats this
+        # after every adopted descendant is gone, so a fast last write or an
+        # escaped setsid child cannot hide from the durable final evidence.
+        final_violations = scope_violations(
+            workspace, meta.get("git_baseline", {}), meta.get("scope", {})
+        )
+        if final_violations:
+            new_violations = sorted(set(final_violations) - set(violated_scope))
+            if new_violations:
+                add_event(
+                    path, "scope_violation", violations=new_violations, final=True
+                )
+            violated_scope = sorted(
+                set(violated_scope) | set(final_violations)
+            )
         if violated_scope:
             state = "scope_violated"
         elif timed_out:
@@ -3977,9 +4454,10 @@ def command_worker(args: argparse.Namespace) -> int:
         notify_user(
             "Agent Orchestrator", f"Job {meta['job_id']} finished: {state}{suffix}"
         )
-    b1_module().release_active_job(
-        job_identity, meta.get("job_id"), reservation_id
-    )
+    if not leased:
+        b1_module().release_active_job(
+            job_identity, meta.get("job_id"), reservation_id
+        )
     return 0 if state == "succeeded" else 1
 
 
@@ -4301,10 +4779,160 @@ def command_watch(args: argparse.Namespace) -> int:
         return 130
 
 
+def command_lease_status(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).expanduser().resolve()
+    identity = canonical_workspace(workspace)
+    if not identity.get("is_git"):
+        raise RunnerError(f"Workspace is not a Git worktree: {workspace}")
+    b2 = b2_module()
+    assessment = b2.assess_lease(identity)
+    owner = assessment.get("owner")
+    processes: list[dict[str, Any]] = []
+    if isinstance(owner, dict):
+        for key in ("coordinator", "supervisor", "worker"):
+            record = owner.get(key)
+            if isinstance(record, dict):
+                processes.append(
+                    {
+                        "role": key,
+                        "record": record,
+                        "probe": b2.process_probe(record),
+                    }
+                )
+    output = {
+        "workspace": identity.get("root"),
+        "git_common_dir": identity.get("git_common_dir"),
+        "lease": assessment,
+        "processes": processes,
+        "lock_inode_stable": not (
+            isinstance(owner, dict)
+            and assessment.get("lock", {}).get("exists")
+            and (
+                owner.get("lock_dev") != assessment["lock"].get("dev")
+                or owner.get("lock_ino") != assessment["lock"].get("ino")
+            )
+        ),
+    }
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        print(f"workspace: {identity.get('root')}")
+        print(f"lease_state: {assessment.get('state')}")
+        if assessment.get("lock_path"):
+            print(f"lock: {assessment['lock_path']}")
+        if owner:
+            print(
+                "owner: job "
+                f"{owner.get('job_id')} epoch {owner.get('epoch')} "
+                f"state {owner.get('state')}"
+            )
+        for item in processes:
+            print(f"{item['role']}: {item['probe']} {item['record']}")
+        if assessment.get("message"):
+            print(f"message: {assessment['message']}")
+        if assessment.get("missing_evidence"):
+            for missing in assessment["missing_evidence"]:
+                print(f"missing_evidence: {missing}")
+        if assessment.get("recovery"):
+            print(f"recovery: {assessment['recovery']}")
+    return 0
+
+
+def command_lease_reconcile(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).expanduser().resolve()
+    identity = canonical_workspace(workspace)
+    if not identity.get("is_git"):
+        raise RunnerError(f"Workspace is not a Git worktree: {workspace}")
+    if args.evidence_file:
+        source = Path(args.evidence_file).expanduser().resolve()
+        if not source.is_file():
+            raise RunnerError(f"Evidence file does not exist: {source}")
+        evidence = source.read_text(encoding="utf-8")
+    else:
+        evidence = args.evidence or ""
+    result = b2_module().reconcile_lease(
+        identity,
+        job_id=args.job_id,
+        operator=args.operator,
+        evidence=evidence,
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            "reconciled: "
+            f"{'yes' if result.get('reconciled') else 'no'}"
+        )
+        if result.get("evidence_path"):
+            print(f"evidence: {result['evidence_path']}")
+    return 0
+
+
+def command_validate_workspace(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).expanduser().resolve()
+    snapshot = b2_module().snapshot_workspace(workspace, strict=True)
+    result = b2_module().validate_protected_workspace(
+        workspace,
+        target_branch=args.target_branch,
+        protected_branches=args.protected_branch,
+        allowed_paths=args.allow_path,
+        denied_paths=args.deny_path,
+        snapshot=snapshot,
+    )
+    output = {"workspace": str(workspace), "snapshot": snapshot, "validation": result}
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        print(f"branch: {result['branch']}")
+        print(f"target_branch: {result['target_branch']}")
+        print(f"protected_branches: {', '.join(result['protected_branches'])}")
+        print(f"dirty_paths: {len(result['dirty_paths'])}")
+        print("status: eligible")
+    return 0
+
+
+def command_lease_supervisor(args: argparse.Namespace) -> int:
+    """Internal B2 supervisor entry point (never a managed implementation)."""
+    return b2_module().run_supervisor(
+        Path(args.job_dir).resolve(), args.lock_fd, args.epoch
+    )
+
+
+def active_lease_for_job(meta: dict[str, Any]) -> bool:
+    """Return whether this job's lease supervisor still owns the repository.
+
+    A terminal ``result.json`` does not imply that every adopted descendant
+    exited. Cancellation must still reach a live supervisor so an escaped
+    double-fork daemon cannot hold the repository until the job timeout.
+    """
+    lease = meta.get("workspace_lease")
+    if not isinstance(lease, dict):
+        return False
+    owner_path = lease.get("owner_path")
+    epoch = lease.get("epoch")
+    if not isinstance(owner_path, str) or not isinstance(epoch, str):
+        return False
+    try:
+        owner = read_json(Path(owner_path))
+    except RunnerError:
+        return False
+    return (
+        owner.get("epoch") == epoch
+        and owner.get("job_id") == meta.get("job_id")
+        and owner.get("state") in {"admission", "supervising"}
+    )
+
+
 def command_cancel(args: argparse.Namespace) -> int:
     path = job_dir(args.job_id)
     status = get_status(path)
-    if status["state"] not in {"starting", "running", "needs_input", "cancelling"}:
+    lease_active = active_lease_for_job(status)
+    if status["state"] not in {
+        "starting",
+        "running",
+        "needs_input",
+        "cancelling",
+    } and not lease_active:
         print_value(status, args.json)
         return 0
     marker = path / "cancel-requested"
@@ -4313,6 +4941,13 @@ def command_cancel(args: argparse.Namespace) -> int:
     child_pid = status.get("child_pid")
     if pid_alive(child_pid):
         terminate_process_group(child_pid, force=args.force)
+    if lease_active:
+        add_event(
+            path,
+            "lease_cancel_requested",
+            force=args.force,
+            terminal_result=status.get("state"),
+        )
     for question in pending_questions(path):
         question_path = worker_question_path(path, question["id"])
         with record_lock(question_path):
@@ -4321,7 +4956,12 @@ def command_cancel(args: argparse.Namespace) -> int:
                 current.update(state="cancelled", cancelled_at=utc_now())
                 write_json(question_path, current)
     add_event(path, "cancellation_requested", force=args.force)
-    output = {"job_id": args.job_id, "state": "cancelling", "force": args.force}
+    output = {
+        "job_id": args.job_id,
+        "state": "cancelling",
+        "force": args.force,
+        "lease_active": lease_active,
+    }
     print_value(output, args.json)
     return 0
 
@@ -4908,6 +5548,19 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--checklist-item")
     launch.add_argument("--timeout-seconds", type=int, default=3600)
     launch.add_argument("--allow-dirty", action="store_true")
+    launch.add_argument(
+        "--target-branch",
+        help=(
+            "Protected research admission: require this dedicated target branch. "
+            "Must be supplied with at least one --protected-branch."
+        ),
+    )
+    launch.add_argument(
+        "--protected-branch",
+        action="append",
+        default=[],
+        help="Branch that may never host a writer (repeatable).",
+    )
     launch.add_argument("--allow-unstructured-task", action="store_true")
     launch.add_argument("--allow-concurrent-workspace", action="store_true")
     launch.add_argument("--allow-large-context", action="store_true")
@@ -4993,6 +5646,46 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--interval", type=float, default=2)
     watch.set_defaults(func=command_watch)
 
+    lease_status = subparsers.add_parser(
+        "lease-status",
+        help="Inspect the repository writer lease and fail-closed recovery evidence",
+    )
+    lease_status.add_argument("--workspace", default=os.getcwd())
+    lease_status.add_argument("--json", action="store_true")
+    lease_status.set_defaults(func=command_lease_status)
+
+    lease_reconcile = subparsers.add_parser(
+        "lease-reconcile",
+        help=(
+            "Record explicit operator evidence that an uncertain writer tree exited; "
+            "the only supported recovery from guardian loss"
+        ),
+    )
+    lease_reconcile.add_argument("--workspace", default=os.getcwd())
+    lease_reconcile.add_argument("--job-id", required=True)
+    lease_reconcile.add_argument("--operator", required=True)
+    lease_reconcile.add_argument("--evidence")
+    lease_reconcile.add_argument("--evidence-file")
+    lease_reconcile.add_argument("--json", action="store_true")
+    lease_reconcile.set_defaults(func=command_lease_reconcile)
+
+    validate_workspace = subparsers.add_parser(
+        "validate-workspace",
+        help=(
+            "Check protected research branch eligibility and dirty overlap without "
+            "changing the branch or index"
+        ),
+    )
+    validate_workspace.add_argument("--workspace", default=os.getcwd())
+    validate_workspace.add_argument("--target-branch", required=True)
+    validate_workspace.add_argument(
+        "--protected-branch", action="append", default=[], required=True
+    )
+    validate_workspace.add_argument("--allow-path", action="append", default=[])
+    validate_workspace.add_argument("--deny-path", action="append", default=[])
+    validate_workspace.add_argument("--json", action="store_true")
+    validate_workspace.set_defaults(func=command_validate_workspace)
+
     cancel = subparsers.add_parser("cancel", help="Request graceful job cancellation")
     cancel.add_argument("job_id")
     cancel.add_argument("--force", action="store_true")
@@ -5061,6 +5754,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker = subparsers.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("--job-dir", required=True)
     worker.set_defaults(func=command_worker)
+
+    supervisor = subparsers.add_parser("_lease-supervisor", help=argparse.SUPPRESS)
+    supervisor.add_argument("--job-dir", required=True)
+    supervisor.add_argument("--lock-fd", type=int, required=True)
+    supervisor.add_argument("--epoch", required=True)
+    supervisor.set_defaults(func=command_lease_supervisor)
     return parser
 
 

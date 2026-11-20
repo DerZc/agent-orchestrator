@@ -1090,6 +1090,18 @@ class CliAgentJobTests(unittest.TestCase):
             terra_data = json.loads(terra.stdout)
             self.assertTrue(terra_data["executor_approval"]["terra_fallback"])
             self.assertEqual(terra_data["reasoning_effort"], "high")
+            # Let the detached worker finish before TemporaryDirectory cleanup;
+            # a live worker may still append durable events to its job dir.
+            self.run_cli(
+                "wait",
+                terra_data["job_id"],
+                "--timeout-seconds",
+                "10",
+                "--poll-seconds",
+                "0.1",
+                "--json",
+                env=env,
+            )
             limited = self.run_cli(
                 "launch",
                 "--cli",
