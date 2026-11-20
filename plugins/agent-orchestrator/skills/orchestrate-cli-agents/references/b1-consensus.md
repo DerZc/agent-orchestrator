@@ -36,6 +36,10 @@ plan digest, the manifest digest, the step ID, the cycle, the vote round and the
 dependency references. A ballot from another policy version or cycle therefore fails as
 stale, and a forged binding or removed-role ballot fails replay.
 
+## D2 validation policy
+
+Strict candidates may include `execution_constraints.version = 2` with an explicit ordered validation policy. It is voted before execution and matched by a version 2 execution contract. Version 1 candidates remain byte-identical and never gain D2 authority. See `d-review-repair.md`.
+
 ## Prerequisites
 
 - `preferences --workspace-mode project` was saved. Worktree mode is rejected.

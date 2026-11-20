@@ -260,3 +260,13 @@ roots require real host bubblewrap: C refuses to start the provider when the dec
 mounts cannot be proven inside the namespace, so those cases skip honestly on hosts without
 working namespaces and are run by Codex on a capable host. Real-namespace and full-host checks
 remain authoritative; no provider quota is used by routine tests.
+
+## D2 extension (implemented in a later slice)
+
+A strict candidate may use `execution_constraints.version = 2` to vote an explicit ordered
+validation policy before execution; a matching version 2 execution contract freezes it.
+Version 1 candidates and contracts keep their exact original bytes and never acquire D2
+authority. `d-review-repair.md` documents the D2 operations: actual B2-leased validation,
+pinned structured unittest evidence, single-use active-Codex review, bounded formal repair
+allocations and the derived `REVIEW_APPROVED` terminal view. D2 never reaches `done`; E/F
+completion, PR/CI/MERGED, dependency opening and commit/index custody remain closed.

@@ -168,6 +168,10 @@ with `answer-feedback <id> --file <file> --json`. `feedback --all --json` includ
 Worker questions remain separately scoped to their exact job. Both answer paths are durable and
 audited; never substitute an assumed answer for user input.
 
+## D2 review and repair routing
+
+When a strict plan has a version 2 contract, run `execution-validate` and `execution-validation-finalize` before any review. Issue a single-use active-Codex session with `execution-review-begin`, record the real review with `execution-review`, and use only `execution-repair-contract` / `execution-repair-allocate` / `execution-repair` for a bounded formal repair. The plan stage ends at `REVIEW_APPROVED`; never mark the item done or open dependencies. See `d-review-repair.md`.
+
 ## Review routing
 
 Use deterministic checks for every job. Use a fresh high-capability review for security-sensitive,

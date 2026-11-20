@@ -2030,8 +2030,49 @@ def d_module():
         b1_module=b1_module,
         b2_module=b2_module,
         c_module=c_module,
+        review_module=review_module,
+        d2_event_validator=lambda event_type, payload: review_module().validate_event_payload(
+            event_type, payload
+        ),
+        d2_overlay=lambda **kwargs: review_module().d2_overlay(**kwargs),
     )
     return _D_MODULE
+
+
+_REVIEW_MODULE: Any = None
+
+
+def review_module():
+    """Load the sibling D2 review/validation/repair module by absolute path."""
+    global _REVIEW_MODULE
+    if _REVIEW_MODULE is None:
+        module_path = Path(__file__).resolve().with_name("d_review.py")
+        spec = importlib.util.spec_from_file_location(
+            "agent_orchestrator_d_review", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RunnerError(f"Cannot load D2 review module: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _REVIEW_MODULE = module
+    _REVIEW_MODULE.configure(
+        runner_error=RunnerError,
+        utc_now=utc_now,
+        state_home=state_home,
+        plans_dir=plans_dir,
+        plan_dir=plan_dir,
+        jobs_dir=jobs_dir,
+        read_json=read_json,
+        write_json=write_json,
+        record_lock=record_lock,
+        canonical_workspace=canonical_workspace,
+        b1_module=b1_module,
+        b2_module=b2_module,
+        c_module=c_module,
+        d_module=d_module,
+    )
+    return _REVIEW_MODULE
 
 
 def execution_source_validator(**kwargs: Any) -> dict[str, Any]:
@@ -2057,10 +2098,16 @@ def managed_launch_validator(
     if kind == "implementation":
         module.validate_implementation_launch(managed, identity)
         return
+    if kind == "validation":
+        review_module().validate_validation_launch(managed, identity)
+        return
     raise RunnerError(f"Unsupported managed launch kind: {kind!r}")
 
 
 def managed_worker_validator(meta: dict[str, Any]) -> str | None:
+    managed = meta.get("managed_execution")
+    if isinstance(managed, dict) and managed.get("kind") == "validation":
+        return review_module().validate_validation_worker(meta)
     return d_module().validate_managed_worker(meta)
 
 
@@ -2697,22 +2744,31 @@ def _managed_launch_args(
         "launch",
         "--cli",
         str(descriptor["provider"]),
-        "--operation",
-        str(descriptor["operation"]),
-        "--approved-executor",
-        str(descriptor["provider"]),
-        "--workspace",
-        str(descriptor["workspace"]),
-        "--task-file",
-        str(descriptor["task_file"]),
-        "--timeout-seconds",
-        str(args.timeout_seconds),
-        "--job-id",
-        str(descriptor["job_id"]),
-        "--allow-unstructured-task",
-        "--no-notify",
-        "--json",
     ]
+    if descriptor["operation"] != "validation":
+        command.extend(
+            [
+                "--operation",
+                str(descriptor["operation"]),
+                "--approved-executor",
+                str(descriptor["provider"]),
+            ]
+        )
+    command.extend(
+        [
+            "--workspace",
+            str(descriptor["workspace"]),
+            "--task-file",
+            str(descriptor["task_file"]),
+            "--timeout-seconds",
+            str(args.timeout_seconds),
+            "--job-id",
+            str(descriptor["job_id"]),
+            "--allow-unstructured-task",
+            "--no-notify",
+            "--json",
+        ]
+    )
     if getattr(args, "config", None):
         command.extend(["--config", str(args.config)])
     managed_args = build_parser().parse_args(command)
@@ -2836,6 +2892,128 @@ def command_execution_abort(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
     return 0 if result.get("aborted") else 2
+
+
+def command_execution_validate(args: argparse.Namespace) -> int:
+    descriptor = review_module().prepare_validation(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+    )
+    return command_launch(_managed_launch_args(descriptor, args))
+
+
+def command_execution_validation_finalize(args: argparse.Namespace) -> int:
+    module = review_module()
+    result = module.finalize_validation(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        job_id=args.job_id or None,
+    )
+    print(
+        json.dumps(result, indent=2, sort_keys=True)
+        if args.json
+        else result.get("classification")
+    )
+    return 0
+
+
+def command_execution_preflight(args: argparse.Namespace) -> int:
+    result = review_module().authorize_validation_preflight(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        invocation_id=args.invocation_id,
+        leader=args.leader,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0
+
+
+def command_execution_review_begin(args: argparse.Namespace) -> int:
+    result = review_module().begin_review(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        purpose=args.purpose,
+        leader=args.leader,
+        session_file=Path(args.session_file),
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0
+
+
+def command_execution_review(args: argparse.Namespace) -> int:
+    result = review_module().record_review(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        review_file=Path(args.review_file),
+        session_file=Path(args.session_file),
+        leader=args.leader,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0
+
+
+def command_execution_repair_contract(args: argparse.Namespace) -> int:
+    contract = read_bounded_json_file(
+        args.contract_file,
+        "repair contract",
+        d_module().MAX_CONTRACT_BYTES,
+    )
+    result = review_module().freeze_repair_contract(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        review_id=args.review_id,
+        contract_raw=contract,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0
+
+
+def command_execution_repair_allocate(args: argparse.Namespace) -> int:
+    result = review_module().allocate_repair(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        review_id=args.review_id,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0
+
+
+def command_execution_repair(args: argparse.Namespace) -> int:
+    descriptor = review_module().prepare_repair(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        allocation_id=args.allocation_id,
+    )
+    try:
+        return command_launch(_managed_launch_args(descriptor, args))
+    except BaseException as exc:
+        try:
+            review_module().record_setup_failure(
+                plan_id=args.plan_id,
+                step_id=args.step_id,
+                allocation_id=args.allocation_id,
+                ordinal=int(descriptor.get("setup_ordinal") or 0) or 1,
+                detail=f"launch failed pre-claim: {type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
+        raise
+
+
+def command_execution_design_link(args: argparse.Namespace) -> int:
+    dispositions = read_bounded_json_file(
+        args.dispositions_file,
+        "design finding dispositions",
+        d_module().MAX_CONTRACT_BYTES,
+    )
+    result = review_module().record_design_link(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        previous_candidate_sha256=args.previous_candidate,
+        finding_dispositions=dispositions,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0
 
 
 def command_metrics(args: argparse.Namespace) -> int:
@@ -4214,7 +4392,11 @@ def command_launch(args: argparse.Namespace) -> int:
     if managed is not None:
         if not isinstance(managed, dict):
             raise RunnerError("Managed execution descriptor is malformed")
-        if managed.get("kind") not in {"discussion", "implementation"}:
+        if managed.get("kind") not in {
+            "discussion",
+            "implementation",
+            "validation",
+        }:
             raise RunnerError("Managed execution descriptor kind is unsupported")
         # The descriptor is constructed only by this runner's execution
         # commands. It is never a user-supplied flag, and it cannot be combined
@@ -4280,12 +4462,26 @@ def command_launch(args: argparse.Namespace) -> int:
             + "; ".join(task_problems)
             + ". Use validate-task or pass --allow-unstructured-task for intentional legacy packets."
         )
-    profiles = load_profiles(config_path(args.config))
-    if args.cli not in profiles:
-        raise RunnerError(f"Unknown CLI profile: {args.cli}")
-    profile = profiles[args.cli]
-    reserved_provider = c_module().is_reserved_provider(profile.get("provider"))
-    provider_binding: dict[str, Any] | None = None
+    validation_job = managed is not None and managed.get("kind") == "validation"
+    if validation_job:
+        # A validator is a trusted coordinator command runner, never a model or
+        # provider. It has no profile executable, prompt transport or C binding.
+        profile = {
+            "name": "validator",
+            "display": "coordinator validator",
+            "provider": None,
+        }
+        reserved_provider = False
+        provider_binding: dict[str, Any] | None = None
+    else:
+        profiles = load_profiles(config_path(args.config))
+        if args.cli not in profiles:
+            raise RunnerError(f"Unknown CLI profile: {args.cli}")
+        profile = profiles[args.cli]
+        reserved_provider = c_module().is_reserved_provider(
+            profile.get("provider")
+        )
+        provider_binding = None
     if reserved_provider:
         if not args.operation:
             raise RunnerError(
@@ -4335,7 +4531,7 @@ def command_launch(args: argparse.Namespace) -> int:
                 "isolation_unavailable: "
                 + (isolation_reason or c_module().SAFE_ISOLATION_ERROR)
             )
-    else:
+    elif not validation_job:
         if args.operation:
             raise RunnerError(
                 "--operation is only valid for the reserved deepseek/glm provider "
@@ -4391,9 +4587,13 @@ def command_launch(args: argparse.Namespace) -> int:
             args.reasoning_effort = (
                 plan.get("executor_policy", {}).get("fallback") or {}
             ).get("reasoning_effort")
-    applied_executor_policy = validate_executor_selection(args, profile, plan)
-    fallback_feedback = validate_terra_fallback(
-        args, plan, plan_item, workspace, task_stats
+    applied_executor_policy = (
+        {} if validation_job else validate_executor_selection(args, profile, plan)
+    )
+    fallback_feedback = (
+        None
+        if validation_job
+        else validate_terra_fallback(args, plan, plan_item, workspace, task_stats)
     )
     validate_dependencies(args.depends_on)
     selected_job_id = args.job_id or make_job_id(args.cli)
@@ -4532,7 +4732,14 @@ def command_launch(args: argparse.Namespace) -> int:
                     "--allow-dirty after recording the baseline"
                 )
             if (args.target_branch or args.protected_branch) and not (
-                managed is not None and managed.get("continuation")
+                validation_job
+                or (
+                    managed is not None
+                    and (
+                        managed.get("continuation")
+                        or managed.get("repair_allocation_id")
+                    )
+                )
             ):
                 # A continuation was already restricted by D1 to the exact
                 # attributable residue of its drained prior invocation. The
@@ -4552,6 +4759,10 @@ def command_launch(args: argparse.Namespace) -> int:
                 # plan lock, then release it before creating or spawning the
                 # worker. A failure here aborts the lease in the outer handler.
                 managed_claim = d_module().claim_implementation(
+                    managed, identity, lease, snapshot
+                )
+            elif managed is not None and managed.get("kind") == "validation":
+                managed_claim = review_module().claim_validation(
                     managed, identity, lease, snapshot
                 )
             if fallback_feedback:
@@ -4599,6 +4810,14 @@ def command_launch(args: argparse.Namespace) -> int:
                 )
                 if managed.get("kind") == "implementation":
                     prompt_text += "\n" + str(managed["contract_prompt"])
+                elif managed.get("kind") == "validation":
+                    prompt_text += (
+                        "\n# D2 validation assignment\n\n"
+                        f"- Validation: `{managed['validation_id']}`\n"
+                        f"- Source attempt: `{managed['source_attempt_id']}`\n"
+                        "Execute only the frozen literal invocations. This job is "
+                        "a coordinator validator, not a model or provider.\n"
+                    )
             task_copy = path / "task.md"
             task_copy.write_text(prompt_text, encoding="utf-8")
             os.chmod(task_copy, 0o600)
@@ -4637,6 +4856,10 @@ def command_launch(args: argparse.Namespace) -> int:
                     "argv": provider_arguments,
                     "prompt_transport": "stdin",
                 }
+            elif validation_job:
+                command = []
+                transport = "none"
+                redacted_command = []
             else:
                 command, transport = build_command(
                     profile,
@@ -4688,6 +4911,25 @@ def command_launch(args: argparse.Namespace) -> int:
                         }
                         if managed["kind"] == "discussion"
                         else {
+                            "validation_id": managed.get("validation_id"),
+                            "batch_id": managed.get("batch_id"),
+                            "policy_digest": managed.get("policy_digest"),
+                            "source_attempt_id": managed.get("source_attempt_id"),
+                            "source_evidence_digest": managed.get(
+                                "source_evidence_digest"
+                            ),
+                            "source_kind": managed.get("source_kind"),
+                            "generation": managed.get("generation"),
+                            "intent_digest": managed["intent_digest"],
+                            "intent_event_id": managed["intent_event_id"],
+                            "claim_digest": (
+                                managed_claim["claim_digest"]
+                                if managed_claim is not None
+                                else None
+                            ),
+                        }
+                        if managed["kind"] == "validation"
+                        else {
                             "intent_digest": managed["intent_digest"],
                             "intent_event_id": managed["intent_event_id"],
                             "claim_digest": (
@@ -4702,6 +4944,15 @@ def command_launch(args: argparse.Namespace) -> int:
                                 "protection_manifest_blob_sha256"
                             ),
                             "protection": managed.get("protection"),
+                            "repair_allocation_id": managed.get(
+                                "repair_allocation_id"
+                            ),
+                            "repair_contract_digest": managed.get(
+                                "repair_contract_digest"
+                            ),
+                            "repair_generation": managed.get(
+                                "repair_generation"
+                            ),
                         }
                     ),
                 }
@@ -4767,6 +5018,11 @@ def command_launch(args: argparse.Namespace) -> int:
                     "max_changed_files": args.max_changed_files,
                 },
                 "git_baseline": snapshot,
+                **(
+                    {"completion_evidence_files": ["validation-evidence.json"]}
+                    if validation_job
+                    else {}
+                ),
                 "workspace_lease": lease.metadata() if lease is not None else None,
                 "protected_research": protected_policy,
                 **(
@@ -4984,8 +5240,12 @@ def command_launch(args: argparse.Namespace) -> int:
         ),
         "plan_id": args.plan_id,
         "checklist_item": args.checklist_item,
-        "executor_approval": selected_executor_approval(
-            applied_executor_policy, args.cli, args.model
+        "executor_approval": (
+            None
+            if validation_job
+            else selected_executor_approval(
+                applied_executor_policy, args.cli, args.model
+            )
         ),
         "workspace": str(workspace),
         "job_dir": str(path),
@@ -5382,6 +5642,12 @@ def command_worker(args: argparse.Namespace) -> int:
                 job_identity, meta.get("job_id"), reservation_id
             )
         raise RunnerError(blocked)
+    managed = meta.get("managed_execution")
+    if isinstance(managed, dict) and managed.get("kind") == "validation":
+        # A validator job executes the frozen literal policy; it never invokes
+        # a model or provider. The B2 supervisor still owns the lease, adoption,
+        # drain and completion receipt around this worker.
+        return review_module().execute_validation_worker(meta_path, path, meta)
     if named_provider_job(meta):
         return run_named_provider_worker(
             meta_path, path, meta, reservation_id, job_identity, leased
@@ -6703,6 +6969,126 @@ def build_parser() -> argparse.ArgumentParser:
     execution_abort.add_argument("--reason", required=True)
     execution_abort.add_argument("--json", action="store_true")
     execution_abort.set_defaults(func=command_execution_abort)
+
+    execution_validate = subparsers.add_parser(
+        "execution-validate",
+        help=(
+            "D2: execute the frozen validation policy under the exclusive B2 "
+            "lease with a coordinator validator (never a model/provider)"
+        ),
+    )
+    execution_validate.add_argument("--plan-id", required=True)
+    execution_validate.add_argument("--step-id", required=True)
+    execution_validate.add_argument("--timeout-seconds", type=int, default=3600)
+    execution_validate.add_argument("--config")
+    execution_validate.add_argument("--json", action="store_true")
+    execution_validate.set_defaults(func=command_execution_validate)
+
+    execution_validation_finalize = subparsers.add_parser(
+        "execution-validation-finalize",
+        help="D2: freeze one complete validation batch from actual B2 evidence",
+    )
+    execution_validation_finalize.add_argument("--plan-id", required=True)
+    execution_validation_finalize.add_argument("--step-id", required=True)
+    execution_validation_finalize.add_argument("--job-id")
+    execution_validation_finalize.add_argument("--json", action="store_true")
+    execution_validation_finalize.set_defaults(
+        func=command_execution_validation_finalize
+    )
+
+    execution_preflight = subparsers.add_parser(
+        "execution-preflight",
+        help=(
+            "D2: record the active Codex leader's preflight for one already "
+            "voted systems_trusted invocation"
+        ),
+    )
+    execution_preflight.add_argument("--plan-id", required=True)
+    execution_preflight.add_argument("--step-id", required=True)
+    execution_preflight.add_argument("--invocation-id", required=True)
+    execution_preflight.add_argument("--leader", required=True)
+    execution_preflight.add_argument("--json", action="store_true")
+    execution_preflight.set_defaults(func=command_execution_preflight)
+
+    execution_review_begin = subparsers.add_parser(
+        "execution-review-begin",
+        help="D2: issue one single-use actual active-Codex review session",
+    )
+    execution_review_begin.add_argument("--plan-id", required=True)
+    execution_review_begin.add_argument("--step-id", required=True)
+    execution_review_begin.add_argument("--purpose", required=True)
+    execution_review_begin.add_argument("--leader", required=True)
+    execution_review_begin.add_argument("--session-file", required=True)
+    execution_review_begin.add_argument("--json", action="store_true")
+    execution_review_begin.set_defaults(func=command_execution_review_begin)
+
+    execution_review = subparsers.add_parser(
+        "execution-review",
+        help=(
+            "D2: record the active Codex leader's actual APPROVE or "
+            "REQUEST_CHANGES review"
+        ),
+    )
+    execution_review.add_argument("--plan-id", required=True)
+    execution_review.add_argument("--step-id", required=True)
+    execution_review.add_argument("--review-file", required=True)
+    execution_review.add_argument("--session-file", required=True)
+    execution_review.add_argument("--leader", required=True)
+    execution_review.add_argument("--json", action="store_true")
+    execution_review.set_defaults(func=command_execution_review)
+
+    execution_repair_contract = subparsers.add_parser(
+        "execution-repair-contract",
+        help="D2: freeze an immutable repair contract from a current rejection",
+    )
+    execution_repair_contract.add_argument("--plan-id", required=True)
+    execution_repair_contract.add_argument("--step-id", required=True)
+    execution_repair_contract.add_argument("--review-id", required=True)
+    execution_repair_contract.add_argument("--contract-file", required=True)
+    execution_repair_contract.add_argument("--json", action="store_true")
+    execution_repair_contract.set_defaults(func=command_execution_repair_contract)
+
+    execution_repair_allocate = subparsers.add_parser(
+        "execution-repair-allocate",
+        help=(
+            "D2: durably consume one formal repair slot (maximum three per step "
+            "across cycles and restarts)"
+        ),
+    )
+    execution_repair_allocate.add_argument("--plan-id", required=True)
+    execution_repair_allocate.add_argument("--step-id", required=True)
+    execution_repair_allocate.add_argument("--review-id", required=True)
+    execution_repair_allocate.add_argument("--json", action="store_true")
+    execution_repair_allocate.set_defaults(func=command_execution_repair_allocate)
+
+    execution_repair = subparsers.add_parser(
+        "execution-repair",
+        help=(
+            "D2: prepare and launch the sole DeepSeek formal repair for one "
+            "durable allocation"
+        ),
+    )
+    execution_repair.add_argument("--plan-id", required=True)
+    execution_repair.add_argument("--step-id", required=True)
+    execution_repair.add_argument("--allocation-id", required=True)
+    execution_repair.add_argument("--timeout-seconds", type=int, default=3600)
+    execution_repair.add_argument("--config")
+    execution_repair.add_argument("--json", action="store_true")
+    execution_repair.set_defaults(func=command_execution_repair)
+
+    execution_design_link = subparsers.add_parser(
+        "execution-design-link",
+        help=(
+            "D2: journal a proven new-design lineage link without resetting the "
+            "repair budget"
+        ),
+    )
+    execution_design_link.add_argument("--plan-id", required=True)
+    execution_design_link.add_argument("--step-id", required=True)
+    execution_design_link.add_argument("--previous-candidate", required=True)
+    execution_design_link.add_argument("--dispositions-file", required=True)
+    execution_design_link.add_argument("--json", action="store_true")
+    execution_design_link.set_defaults(func=command_execution_design_link)
 
     metrics = subparsers.add_parser(
         "metrics", help="Aggregate recent executor outcomes and provider-reported usage"

@@ -627,6 +627,11 @@ def classify_job_capability(meta: Any) -> str:
     """Classify another live job for admission serialization, failing closed."""
     if not isinstance(meta, dict):
         return "unknown"
+    managed = meta.get("managed_execution")
+    if isinstance(managed, dict) and managed.get("kind") == "validation":
+        # Explicit validator classification: never a legacy generic writer or a
+        # readonly provider. A validator holds the exclusive repository lease.
+        return "validator"
     if "provider_binding" in meta:
         try:
             binding_from_meta(meta)
