@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -185,8 +186,18 @@ class B2WorkspaceTests(unittest.TestCase):
         self.fail("Timed out waiting for condition")
 
     def wait_file(self, path: Path, timeout: float = 20) -> str:
-        self.wait_for(path.is_file, timeout)
-        return path.read_text(encoding="utf-8").strip()
+        # Waiting for the inode alone races writers that create the file
+        # before populating it. Read once per poll and return what was seen.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                text = ""
+            if text:
+                return text
+            time.sleep(0.05)
+        self.fail(f"Timed out waiting for nonempty file: {path}")
 
     def wait_pid(self, pid: int, timeout: float = 20) -> None:
 
@@ -385,6 +396,37 @@ class B2WorkspaceTests(unittest.TestCase):
         }
         path.write_text(json.dumps(record), encoding="utf-8")
         return path
+
+    # ------------------------------------------------------------------
+    # Readiness helper
+    # ------------------------------------------------------------------
+
+    def test_wait_file_waits_for_populated_readiness_record(self) -> None:
+        ready = self.root / "ready-populated-late"
+        ready.write_text("", encoding="utf-8")
+        expected = "424242"
+
+        def populate() -> None:
+            time.sleep(0.3)
+            ready.write_text(expected, encoding="utf-8")
+
+        writer = threading.Thread(target=populate)
+        writer.start()
+        self.addCleanup(writer.join, 5)
+        started = time.monotonic()
+        observed = self.wait_file(ready, timeout=5)
+        elapsed = time.monotonic() - started
+        self.assertEqual(observed, expected)
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertEqual(int(observed), 424242)
+
+        # A nonempty but malformed record is returned as observed and must
+        # fail PID validation later rather than being retried until timeout.
+        malformed = self.root / "ready-malformed"
+        malformed.write_text("not-a-pid", encoding="utf-8")
+        self.assertEqual(self.wait_file(malformed, timeout=1), "not-a-pid")
+        with self.assertRaises(ValueError):
+            int(self.wait_file(malformed, timeout=1))
 
     # ------------------------------------------------------------------
     # One writer across state homes, aliases and distinct repositories
