@@ -1,0 +1,73 @@
+# B1 CONSENSUS — step `step-one`, cycle 1
+
+Plan: `v1-plan`
+Policy: `b1-durable-consensus` version 1
+Roles: Codex, Antigravity, DeepSeek, GLM
+Round budget: 3 complete protocol rounds
+Outcome: `CONSENSUS_REACHED`
+Frozen digest: `a38a8f988e9584cb0721ddc5c46190b419f146b2ad34f11d1be99dfa577fb9e4`
+
+## Frozen candidate
+
+Frozen digest: `a38a8f988e9584cb0721ddc5c46190b419f146b2ad34f11d1be99dfa577fb9e4`
+
+Binding:
+
+```json
+{
+  "cycle": 1,
+  "dependency_references": [],
+  "manifest_digest": "a26183920e186ccdc4e9c219414d35b9cb09ef0760bf290446b0477e46834bcf",
+  "plan_id": "v1-plan",
+  "plan_sha256": "a5785f8fedd7d6109852feedb28682fd447140f64bab120f9dac409b7999d711",
+  "policy": {
+    "name": "b1-durable-consensus",
+    "version": 1
+  },
+  "step_id": "step-one",
+  "vote_round": 3
+}
+```
+
+### Final design
+
+Use one immutable event ledger with canonical digests and projection regeneration.
+
+### Important decisions
+
+- events are authoritative
+
+### Rejected alternatives and reasons
+
+- append-only JSONL — partial tail recovery risk
+
+### Objection dispositions
+
+- `O001` accepted — projection regeneration recovers this case
+
+### Remaining risks
+
+- POSIX local filesystem assumptions
+
+## Numbered objections
+
+- `O001` (codex): Define recovery for a crash before projections.
+
+## Ballots
+
+- Codex: **AGREE** against `a38a8f988e9584cb0721ddc5c46190b419f146b2ad34f11d1be99dfa577fb9e4`; provenance `v1-job-codex`; rationale: historical four-agent agreement
+- Antigravity: **AGREE** against `a38a8f988e9584cb0721ddc5c46190b419f146b2ad34f11d1be99dfa577fb9e4`; provenance `v1-job-antigravity`; rationale: historical four-agent agreement
+- DeepSeek: **AGREE** against `a38a8f988e9584cb0721ddc5c46190b419f146b2ad34f11d1be99dfa577fb9e4`; provenance `v1-job-deepseek`; rationale: historical four-agent agreement
+- GLM: **AGREE** against `a38a8f988e9584cb0721ddc5c46190b419f146b2ad34f11d1be99dfa577fb9e4`; provenance `v1-job-glm`; rationale: historical four-agent agreement
+
+## Pauses
+
+- (none)
+
+## Final consensus
+
+All 4 roles explicitly AGREE against the frozen digest.
+
+B1 reports CONSENSUS_REACHED and starts no managed writer. Verified
+MERGED dependency evidence and the B2 implementation lease are still
+required before implementation.

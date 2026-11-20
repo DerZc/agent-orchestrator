@@ -1113,16 +1113,21 @@ def validate_profile(name: str, raw: Any) -> dict[str, Any]:
     return profile
 
 
-def resolve_profile_executable(profile: dict[str, Any]) -> tuple[str, str | None]:
+def resolve_profile_executable(
+    profile: dict[str, Any], workspace: Path | None = None
+) -> tuple[str, str | None]:
     """Return the requested executable name and first installed candidate, if any.
 
     Reserved named providers are Bash functions, never PATH executables.  Their
-    availability probe runs the configured interactive context and discards all
-    startup output.
+    availability probe always runs inside bubblewrap with a read-only root and
+    an unshared network namespace before the rcfile is loaded; the check never
+    dispatches the provider function or a model.
     """
     provider = profile.get("provider")
     if c_module().is_reserved_provider(provider):
-        available, _reason = c_module().probe_provider(profile)
+        available, _reason = c_module().probe_provider(
+            profile, workspace=workspace
+        )
         return str(provider), f"bash-function:{provider}" if available else None
     candidates = profile.get("executable_candidates", [profile["argv"][0]])
     for candidate in candidates:
@@ -1640,7 +1645,7 @@ def build_command(
         "prompt_text": prompt_text,
     }
     argv = list(profile["argv"])
-    executable, found = resolve_profile_executable(profile)
+    executable, found = resolve_profile_executable(profile, workspace)
     argv[0] = found or executable
     controls = (
         (model, "model_args", "model", str(model) if model is not None else ""),
@@ -1954,6 +1959,11 @@ def b1_module():
         active_jobs_for_identity=active_jobs_for_canonical_workspace,
         lease_blocker=lease_blocker,
         lease_worker_blocker=worker_lease_block,
+        execution_source_validator=execution_source_validator,
+        execution_overlay=execution_overlay,
+        execution_cycle_guard=execution_cycle_guard,
+        managed_launch_validator=managed_launch_validator,
+        managed_worker_validator=managed_worker_validator,
     )
     return _B1_MODULE
 
@@ -1987,6 +1997,71 @@ def b2_module():
         release_reservation=release_repository_reservation,
     )
     return _B2_MODULE
+
+
+_D_MODULE: Any = None
+
+
+def d_module():
+    """Load the sibling D1 execution module by absolute path."""
+    global _D_MODULE
+    if _D_MODULE is None:
+        module_path = Path(__file__).resolve().with_name("d_execution.py")
+        spec = importlib.util.spec_from_file_location(
+            "agent_orchestrator_d_execution", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise RunnerError(f"Cannot load managed execution module: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _D_MODULE = module
+    _D_MODULE.configure(
+        runner_error=RunnerError,
+        utc_now=utc_now,
+        state_home=state_home,
+        plans_dir=plans_dir,
+        plan_dir=plan_dir,
+        jobs_dir=jobs_dir,
+        read_json=read_json,
+        write_json=write_json,
+        record_lock=record_lock,
+        canonical_workspace=canonical_workspace,
+        b1_module=b1_module,
+        b2_module=b2_module,
+        c_module=c_module,
+    )
+    return _D_MODULE
+
+
+def execution_source_validator(**kwargs: Any) -> dict[str, Any]:
+    return d_module().execution_source_validator(**kwargs)
+
+
+def execution_overlay(**kwargs: Any) -> dict[str, Any]:
+    return d_module().execution_overlay(**kwargs)
+
+
+def execution_cycle_guard(**kwargs: Any) -> str | None:
+    return d_module().cycle_mutation_guard(**kwargs)
+
+
+def managed_launch_validator(
+    managed: dict[str, Any], identity: dict[str, Any]
+) -> None:
+    module = d_module()
+    kind = managed.get("kind")
+    if kind == "discussion":
+        module.validate_discussion_launch(managed, identity)
+        return
+    if kind == "implementation":
+        module.validate_implementation_launch(managed, identity)
+        return
+    raise RunnerError(f"Unsupported managed launch kind: {kind!r}")
+
+
+def managed_worker_validator(meta: dict[str, Any]) -> str | None:
+    return d_module().validate_managed_worker(meta)
 
 
 def release_repository_reservation(
@@ -2133,6 +2208,8 @@ def command_create_plan(args: argparse.Namespace) -> int:
         raise RunnerError("--manifest-file requires --research-team")
     if args.research_team and not args.manifest_file:
         raise RunnerError("--research-team requires a structured --manifest-file")
+    if args.strict_execution and not args.research_team:
+        raise RunnerError("--strict-execution requires --research-team")
     try:
         text = source.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -2190,6 +2267,7 @@ def command_create_plan(args: argparse.Namespace) -> int:
             executor_policy=policy,
             manifest_raw=manifest_raw,
             policy_version=args.policy_version,
+            strict_execution=bool(args.strict_execution),
         )
         output = dict(managed["plan"])
         output["idempotent"] = bool(managed.get("idempotent"))
@@ -2277,6 +2355,13 @@ def command_plan_status(args: argparse.Namespace) -> int:
                 print(
                     f"{item['id']}\t{item['consensus_state']}\t{item['title']}"
                 )
+            execution = plan.get("execution")
+            if isinstance(execution, dict):
+                print(f"execution_stage: {execution.get('stage')}")
+                if execution.get("next_action"):
+                    print(f"execution_next_action: {execution['next_action']}")
+                for reason in execution.get("blocked_reasons") or []:
+                    print(f"execution_blocked: {reason}")
             if checkpoint.get("missing_actions"):
                 print("missing_actions:")
                 for action in checkpoint["missing_actions"]:
@@ -2435,21 +2520,77 @@ def print_consensus_result(result: dict[str, Any], as_json: bool) -> int:
     return 0
 
 
+def managed_source(job_id: str | None) -> dict[str, Any] | None:
+    if job_id is None:
+        return None
+    d_module().wait_for_source_settled(job_id)
+    return {"job_id": job_id}
+
+
+def require_strict_source_before_provenance(
+    plan_id: str,
+    *,
+    role: str,
+    source: dict[str, Any] | None,
+    source_job: str | None,
+    job_id: str | None,
+    leader: str | None,
+    action: str,
+) -> None:
+    """Give strict plans a fail-closed diagnostic for manual bypass attempts."""
+    try:
+        strict = b1_module().plan_is_strict_execution(plan_id)
+    except Exception:
+        # Unknown or unreadable plans fail in the normal replay path.
+        return
+    if source_job is not None:
+        if not strict:
+            raise RunnerError(
+                "--source-job provenance is available only for strict-execution plans"
+            )
+        # The settled-job wait and immutable-ingestion checks follow.
+        return
+    if source is not None or job_id or leader:
+        return
+    if strict:
+        if role == "codex":
+            raise RunnerError(
+                f"Strict-execution Codex {action}s require --leader and must not "
+                "claim a provider job identity"
+            )
+        raise RunnerError(
+            f"Strict-execution {action} requires --source-job evidence from a "
+            "settled reserved provider job; role labels and manual records grant "
+            "no authority"
+        )
+
+
 def command_consensus_submit(args: argparse.Namespace) -> int:
     b1 = b1_module()
     submission = read_bounded_json_file(
         args.submission_file, "submission", b1.MAX_SUBMISSION_BYTES
     )
+    require_strict_source_before_provenance(
+        args.plan_id,
+        role=args.role,
+        source=None,
+        source_job=getattr(args, "source_job", None),
+        job_id=args.job_id,
+        leader=args.leader,
+        action="submission",
+    )
+    source = managed_source(getattr(args, "source_job", None))
     result = b1.submit_consensus(
         plan_id=args.plan_id,
         step_id=args.step_id,
         role=args.role,
         round_number=args.round_number,
         submission_raw=submission,
-        job_id=args.job_id,
+        job_id=args.job_id or (source["job_id"] if source else None),
         leader=args.leader,
         retry_id=args.retry_id,
         operation_id=args.operation_id,
+        source=source,
     )
     return print_consensus_result(result, args.json)
 
@@ -2469,6 +2610,16 @@ def command_consensus_freeze(args: argparse.Namespace) -> int:
 
 
 def command_consensus_vote(args: argparse.Namespace) -> int:
+    require_strict_source_before_provenance(
+        args.plan_id,
+        role=args.role,
+        source=None,
+        source_job=getattr(args, "source_job", None),
+        job_id=args.job_id,
+        leader=args.leader,
+        action="ballot",
+    )
+    source = managed_source(getattr(args, "source_job", None))
     result = b1_module().cast_ballot(
         plan_id=args.plan_id,
         step_id=args.step_id,
@@ -2476,10 +2627,11 @@ def command_consensus_vote(args: argparse.Namespace) -> int:
         digest=args.digest,
         vote=args.vote,
         rationale=args.rationale,
-        job_id=args.job_id,
+        job_id=args.job_id or (source["job_id"] if source else None),
         leader=args.leader,
         retry_id=args.retry_id,
         operation_id=args.operation_id,
+        source=source,
     )
     return print_consensus_result(result, args.json)
 
@@ -2533,8 +2685,157 @@ def command_consensus_new_cycle(args: argparse.Namespace) -> int:
         authorized_by=args.authorized_by,
         authorization=authorization,
         operation_id=args.operation_id,
+        authorization_kind=getattr(args, "authorization_kind", None),
     )
     return print_consensus_result(result, args.json)
+
+
+def _managed_launch_args(
+    descriptor: dict[str, Any], args: argparse.Namespace
+) -> argparse.Namespace:
+    command = [
+        "launch",
+        "--cli",
+        str(descriptor["provider"]),
+        "--operation",
+        str(descriptor["operation"]),
+        "--approved-executor",
+        str(descriptor["provider"]),
+        "--workspace",
+        str(descriptor["workspace"]),
+        "--task-file",
+        str(descriptor["task_file"]),
+        "--timeout-seconds",
+        str(args.timeout_seconds),
+        "--job-id",
+        str(descriptor["job_id"]),
+        "--allow-unstructured-task",
+        "--no-notify",
+        "--json",
+    ]
+    if getattr(args, "config", None):
+        command.extend(["--config", str(args.config)])
+    managed_args = build_parser().parse_args(command)
+    managed_args.managed_execution = descriptor
+    return managed_args
+
+
+def command_execution_discussion(args: argparse.Namespace) -> int:
+    descriptor = d_module().prepare_discussion(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        role=args.role,
+        round_number=args.round_number,
+        task_file=Path(args.task_file),
+    )
+    return command_launch(_managed_launch_args(descriptor, args))
+
+
+def command_execution_contract(args: argparse.Namespace) -> int:
+    contract = read_bounded_json_file(
+        args.contract_file,
+        "execution contract",
+        d_module().MAX_CONTRACT_BYTES,
+    )
+    result = d_module().freeze_contract(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        contract_raw=contract,
+        operation_id=getattr(args, "operation_id", None),
+    )
+    print(
+        json.dumps(result, indent=2, sort_keys=True)
+        if args.json
+        else result["contract_digest"]
+    )
+    return 0
+
+
+def command_execution_implement(args: argparse.Namespace) -> int:
+    module = d_module()
+    descriptor = module.prepare_implementation(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        task_file=Path(args.task_file),
+    )
+    try:
+        return command_launch(_managed_launch_args(descriptor, args))
+    except BaseException as exc:
+        # A deterministic pre-spawn failure must close the intent as an explicit
+        # no-start only when every recorded fact proves that. Anything else stays
+        # pending/uncertain for finalize and cannot be silently retried.
+        try:
+            outcome = module.abort_unstarted(
+                plan_id=args.plan_id,
+                step_id=args.step_id,
+                job_id=descriptor["job_id"],
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            outcome = None
+        if isinstance(outcome, dict) and outcome.get("aborted"):
+            raise RunnerError(
+                f"managed implementation did not start: {type(exc).__name__}: {exc}"
+            ) from exc
+        raise
+
+
+def command_execution_finalize(args: argparse.Namespace) -> int:
+    module = d_module()
+    job_id = args.job_id or module.latest_implementation_job(
+        args.plan_id, args.step_id
+    )
+    if job_id and (jobs_dir() / job_id / "meta.json").is_file():
+        module.wait_for_job_evidence_settled(job_id)
+    result = module.finalize_implementation(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        job_id=job_id or None,
+    )
+    print(
+        json.dumps(result, indent=2, sort_keys=True)
+        if args.json
+        else result.get("state")
+    )
+    return 0
+
+
+def command_execution_continue(args: argparse.Namespace) -> int:
+    if bool(args.authorization) == bool(args.authorization_file):
+        raise RunnerError(
+            "Provide exactly one of --authorization or --authorization-file"
+        )
+    authorization = args.authorization
+    if args.authorization_file:
+        source = Path(args.authorization_file).expanduser().resolve()
+        if not source.is_file():
+            raise RunnerError(f"Authorization file does not exist: {source}")
+        if source.stat().st_size > MAX_TASK_BYTES:
+            raise RunnerError(f"Authorization file exceeds {MAX_TASK_BYTES} bytes")
+        authorization = source.read_text(encoding="utf-8")
+    result = d_module().authorize_continuation(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        operator=args.operator,
+        authorization=authorization,
+    )
+    print(
+        json.dumps(result, indent=2, sort_keys=True)
+        if args.json
+        else result.get("continuation_digest")
+    )
+    return 0
+
+
+def command_execution_abort(args: argparse.Namespace) -> int:
+    result = d_module().abort_unstarted(
+        plan_id=args.plan_id,
+        step_id=args.step_id,
+        job_id=args.job_id,
+        reason=args.reason,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else result)
+    return 0 if result.get("aborted") else 2
 
 
 def command_metrics(args: argparse.Namespace) -> int:
@@ -3362,7 +3663,9 @@ def command_catalog(args: argparse.Namespace) -> int:
         if name not in profiles:
             raise RunnerError(f"Unknown CLI profile: {name}")
         profile = profiles[name]
-        executable, found = resolve_profile_executable(profile)
+        executable, found = resolve_profile_executable(
+            profile, workspace
+        )
         item: dict[str, Any] = {
             "display_name": profile.get("display_name", name),
             "description": profile.get("description"),
@@ -3419,7 +3722,9 @@ def command_choices(args: argparse.Namespace) -> int:
     for name, profile in sorted(profiles.items()):
         if profile.get("maturity") == "legacy" and not args.include_unavailable:
             continue
-        executable, found = resolve_profile_executable(profile)
+        executable, found = resolve_profile_executable(
+            profile, getattr(args, "workspace", None)
+        )
         if not found and not args.include_unavailable:
             continue
         harnesses.append(
@@ -3905,7 +4210,49 @@ def wait_for_lease_handoff(
 
 
 def command_launch(args: argparse.Namespace) -> int:
-    route = apply_launch_route(args)
+    managed = getattr(args, "managed_execution", None)
+    if managed is not None:
+        if not isinstance(managed, dict):
+            raise RunnerError("Managed execution descriptor is malformed")
+        if managed.get("kind") not in {"discussion", "implementation"}:
+            raise RunnerError("Managed execution descriptor kind is unsupported")
+        # The descriptor is constructed only by this runner's execution
+        # commands. It is never a user-supplied flag, and it cannot be combined
+        # with widening launch flags because the managed commands do not expose
+        # them. Every protected value comes from the execution journal.
+        args.cli = str(managed["provider"])
+        args.operation = str(managed["operation"])
+        args.job_id = str(managed["job_id"])
+        args.plan_id = str(managed["plan_id"])
+        args.checklist_item = str(managed["step_id"])
+        args.role = str(managed.get("role") or "managed-execution")
+        args.workspace = str(managed["workspace"])
+        args.task_file = str(managed["task_file"])
+        args.approved_executor = [str(managed["provider"])]
+        args.approved_expensive_executor = []
+        args.model = None
+        args.cli_agent = None
+        args.max_turns = None
+        args.max_cost_usd = None
+        args.reasoning_effort = None
+        args.use_terra_fallback = False
+        args.feedback_id = None
+        args.allow_concurrent_workspace = False
+        args.allow_dirty = True
+        args.allow_unstructured_task = True
+        args.allow_large_context = True
+        args.depends_on = []
+        args.group = None
+        args.allow_path = list(managed.get("allowed_paths") or [])
+        args.deny_path = list(managed.get("denied_paths") or [])
+        args.max_changed_files = managed.get("max_changed_files")
+        args.target_branch = managed.get("target_branch")
+        args.protected_branch = list(managed.get("protected_branches") or [])
+        args.route = None
+        args.coordinator_model = None
+        route = None
+    else:
+        route = apply_launch_route(args)
     workspace = Path(args.workspace).expanduser().resolve()
     task_source = Path(args.task_file).expanduser().resolve()
     if not workspace.is_dir():
@@ -3973,11 +4320,15 @@ def command_launch(args: argparse.Namespace) -> int:
         if resolved_rcfile:
             profile = dict(profile)
             profile["provider_rcfile"] = resolved_rcfile
-        available, reason = c_module().probe_provider(profile)
+        available, reason = c_module().probe_provider(
+            profile, workspace=workspace
+        )
         if not available:
-            raise RunnerError(
-                f"provider_unavailable: {reason or 'reserved provider is unavailable'}"
-            )
+            message = reason or "reserved provider is unavailable"
+            folded = message.casefold()
+            if "bubblewrap" in folded or "isolation" in folded:
+                raise RunnerError(f"isolation_unavailable: {message}")
+            raise RunnerError(f"provider_unavailable: {message}")
         isolation_ok, isolation_reason = c_module().isolation_status()
         if not isolation_ok:
             raise RunnerError(
@@ -4005,7 +4356,7 @@ def command_launch(args: argparse.Namespace) -> int:
         raise RunnerError("--plan-id and --checklist-item must be supplied together")
     plan: dict[str, Any] | None = None
     plan_item: dict[str, Any] | None = None
-    if args.plan_id:
+    if args.plan_id and managed is None:
         _, plan = read_plan(args.plan_id)
         matching = [
             item
@@ -4057,14 +4408,24 @@ def command_launch(args: argparse.Namespace) -> int:
     # the lock is released, so concurrent enrollment/launch paths observe one
     # ordering. The supervisor then inherits the locked descriptor and holds it
     # for the full descendant lifetime.
-    with b1_module().launch_admission(workspace, args.plan_id) as identity:
+    with b1_module().launch_admission(
+        workspace, args.plan_id, managed=managed
+    ) as identity:
         if path.exists():
             raise RunnerError(f"Job already exists: {selected_job_id}")
-        scope_config = {
-            "allowed_paths": args.allow_path,
-            "denied_paths": args.deny_path,
-            "max_changed_files": args.max_changed_files,
-        }
+        scope_config = (
+            {
+                "allowed_paths": list(managed.get("allowed_paths") or []),
+                "denied_paths": list(managed.get("denied_paths") or []),
+                "max_changed_files": managed.get("max_changed_files"),
+            }
+            if managed is not None
+            else {
+                "allowed_paths": args.allow_path,
+                "denied_paths": args.deny_path,
+                "max_changed_files": args.max_changed_files,
+            }
+        )
         if identity.get("is_git"):
             if reserved_provider and not identity.get("is_work_tree"):
                 raise RunnerError(
@@ -4146,11 +4507,20 @@ def command_launch(args: argparse.Namespace) -> int:
                 lease = b2_module().acquire_writer_lease(
                     identity, selected_job_id, path
                 )
-            extra_paths = (
-                b2_module().scope_observation_paths(workspace, scope_config)
-                if identity.get("is_git") and identity.get("is_work_tree")
-                else []
-            )
+            if identity.get("is_git") and identity.get("is_work_tree"):
+                if managed is not None and managed.get("kind") == "implementation":
+                    # D1 observations also hash pre-existing ignored and
+                    # hidden-index bytes. The launch baseline must observe the
+                    # exact same path set as the intent/claim/worker snapshots.
+                    extra_paths = d_module().implementation_observation_paths(
+                        workspace, scope_config
+                    )
+                else:
+                    extra_paths = b2_module().scope_observation_paths(
+                        workspace, scope_config
+                    )
+            else:
+                extra_paths = []
             snapshot = git_snapshot(
                 workspace, strict=True, extra_paths=extra_paths
             )
@@ -4161,7 +4531,12 @@ def command_launch(args: argparse.Namespace) -> int:
                     "Workspace has uncommitted changes; use a clean worktree or pass "
                     "--allow-dirty after recording the baseline"
                 )
-            if args.target_branch or args.protected_branch:
+            if (args.target_branch or args.protected_branch) and not (
+                managed is not None and managed.get("continuation")
+            ):
+                # A continuation was already restricted by D1 to the exact
+                # attributable residue of its drained prior invocation. The
+                # ordinary dirty-overlap check only applies to a fresh attempt.
                 protected_policy = b2_module().validate_protected_workspace(
                     workspace,
                     target_branch=args.target_branch,
@@ -4169,6 +4544,15 @@ def command_launch(args: argparse.Namespace) -> int:
                     allowed_paths=args.allow_path,
                     denied_paths=args.deny_path,
                     snapshot=snapshot,
+                )
+            managed_claim: dict[str, Any] | None = None
+            if managed is not None and managed.get("kind") == "implementation":
+                # The actual lease is held and the authoritative baseline has
+                # been captured. Publish the protected claim under the same B1
+                # plan lock, then release it before creating or spawning the
+                # worker. A failure here aborts the lease in the outer handler.
+                managed_claim = d_module().claim_implementation(
+                    managed, identity, lease, snapshot
                 )
             if fallback_feedback:
                 claim_feedback_for_fallback(fallback_feedback["id"], selected_job_id)
@@ -4202,6 +4586,19 @@ def command_launch(args: argparse.Namespace) -> int:
                         str(provider_binding["operation"])
                     )
                 )
+            if managed is not None:
+                prompt_text += (
+                    "\n\n# D1 managed assignment\n\n"
+                    f"- Kind: {managed['kind']}\n"
+                    f"- Plan: `{managed['plan_id']}`\n"
+                    f"- Step: `{managed['step_id']}`\n"
+                    f"- Cycle: {managed['cycle']}\n"
+                    f"- Round: {managed.get('round') or '-'}\n"
+                    f"- Role/provider: {managed.get('role')}\n"
+                    f"- Job: `{managed['job_id']}`\n"
+                )
+                if managed.get("kind") == "implementation":
+                    prompt_text += "\n" + str(managed["contract_prompt"])
             task_copy = path / "task.md"
             task_copy.write_text(prompt_text, encoding="utf-8")
             os.chmod(task_copy, 0o600)
@@ -4260,6 +4657,54 @@ def command_launch(args: argparse.Namespace) -> int:
                     )
                     for token in command
                 ]
+            managed_meta: dict[str, Any] | None = None
+            if managed is not None:
+                managed_meta = {
+                    "version": int(managed["version"]),
+                    "kind": managed["kind"],
+                    "plan_id": managed["plan_id"],
+                    "step_id": managed["step_id"],
+                    "cycle": managed["cycle"],
+                    "round": managed.get("round"),
+                    "role": managed.get("role"),
+                    "provider": managed["provider"],
+                    "operation": managed["operation"],
+                    "job_id": managed["job_id"],
+                    "candidate_sha256": managed.get("candidate_sha256"),
+                    "contract_digest": managed.get("contract_digest"),
+                    "task_source_sha256": managed["task_source_sha256"],
+                    "constraints": managed.get("constraints"),
+                    "allowed_paths": list(managed.get("allowed_paths") or []),
+                    "denied_paths": list(managed.get("denied_paths") or []),
+                    "max_changed_files": managed.get("max_changed_files"),
+                    "target_branch": managed.get("target_branch"),
+                    "protected_branches": list(
+                        managed.get("protected_branches") or []
+                    ),
+                    **(
+                        {
+                            "assignment_digest": managed["assignment_digest"],
+                            "assignment_event_id": managed["assignment_event_id"],
+                        }
+                        if managed["kind"] == "discussion"
+                        else {
+                            "intent_digest": managed["intent_digest"],
+                            "intent_event_id": managed["intent_event_id"],
+                            "claim_digest": (
+                                managed_claim["claim_digest"]
+                                if managed_claim is not None
+                                else None
+                            ),
+                            "protection_manifest_digest": managed.get(
+                                "protection_manifest_digest"
+                            ),
+                            "protection_manifest_blob_sha256": managed.get(
+                                "protection_manifest_blob_sha256"
+                            ),
+                            "protection": managed.get("protection"),
+                        }
+                    ),
+                }
             meta = {
                 "job_id": selected_job_id,
                 "agent": args.cli,
@@ -4324,6 +4769,11 @@ def command_launch(args: argparse.Namespace) -> int:
                 "git_baseline": snapshot,
                 "workspace_lease": lease.metadata() if lease is not None else None,
                 "protected_research": protected_policy,
+                **(
+                    {"managed_execution": managed_meta}
+                    if managed_meta is not None
+                    else {}
+                ),
                 "command": redacted_command,
                 "channel": str(channel_path),
             }
@@ -4368,7 +4818,7 @@ def command_launch(args: argparse.Namespace) -> int:
                 else {}
             ),
         )
-        if args.plan_id:
+        if args.plan_id and managed is None:
             bind_plan_item(args.plan_id, args.checklist_item, selected_job_id)
     except BaseException as exc:
         if lease is not None:
@@ -4704,6 +5154,23 @@ def run_named_provider_worker(
                 workspace, meta.get("git_baseline", {}), meta.get("scope", {})
             )
 
+        if meta.get("managed_execution") is not None:
+            # Last fail-closed check immediately before the effectful provider
+            # spawn: the protected assignment/claim, current B1 binding, C
+            # capability and actual B2 ownership must still agree.
+            managed_block = d_module().validate_managed_worker(meta)
+            if managed_block:
+                raise c_module().ProviderError(
+                    "unauthorized_role", managed_block
+                )
+            worker_protection = (
+                d_module().protection_for_worker(meta)
+                if meta["managed_execution"].get("kind") == "implementation"
+                else None
+            )
+        else:
+            worker_protection = None
+
         run = c_module().run_provider(
             profile=meta["profile"],
             binding=binding,
@@ -4721,6 +5188,7 @@ def run_named_provider_worker(
             on_heartbeat=on_heartbeat,
             on_event=on_event,
             scope_check=check_scope,
+            protection=worker_protection,
         )
         exit_code = run.exit_code
         write_sanitized_provider_logs(
@@ -5298,6 +5766,8 @@ def update_plan_after_review(meta: dict[str, Any], review: dict[str, Any]) -> No
 def command_record_review(args: argparse.Namespace) -> int:
     path = job_dir(args.job_id)
     meta = read_json(path / "meta.json")
+    if meta.get("managed_execution") is not None:
+        d_module().refuse_closed_gate("legacy review acceptance of a D1 job")
     if meta.get("plan_id"):
         _, linked_plan = read_plan(meta["plan_id"])
         b1_module().require_legacy_plan_mutable(linked_plan)
@@ -5691,6 +6161,28 @@ def dashboard_rows(group: str | None, limit: int) -> list[dict[str, Any]]:
                 baseline.get("status", [])
             )
             last_event = status.get("last_event") or {}
+            plan_execution: dict[str, Any] | None = None
+            plan_id = status.get("plan_id")
+            if isinstance(plan_id, str) and plan_id:
+                plan_path = plans_dir() / plan_id / "plan.json"
+                if plan_path.is_file():
+                    try:
+                        plan_document = read_json(plan_path)
+                        if isinstance(plan_document.get("execution"), dict):
+                            plan_execution = {
+                                "stage": plan_document["execution"].get("stage"),
+                                "next_action": plan_document["execution"].get(
+                                    "next_action"
+                                ),
+                                "source_drift": bool(
+                                    plan_document["execution"].get("source_drift")
+                                ),
+                                "blocked_reasons": plan_document["execution"].get(
+                                    "blocked_reasons"
+                                ),
+                            }
+                    except (RunnerError, ValueError, OSError):
+                        plan_execution = None
             rows.append(
                 {
                     "job_id": status.get("job_id"),
@@ -5704,8 +6196,10 @@ def dashboard_rows(group: str | None, limit: int) -> list[dict[str, Any]]:
                     "state": status.get("state"),
                     "review_state": status.get("review_state"),
                     "acceptance_state": status.get("acceptance_state"),
-                    "plan_id": status.get("plan_id"),
+                    "plan_id": plan_id,
                     "checklist_item": status.get("checklist_item"),
+                    "managed_execution": status.get("managed_execution"),
+                    "plan_execution": plan_execution,
                     "usage_summary": status.get("usage_summary"),
                     "phase": status.get("current_phase"),
                     "elapsed_seconds": elapsed_seconds(status),
@@ -5975,6 +6469,15 @@ def build_parser() -> argparse.ArgumentParser:
             "feedback remains unanswered for this grace period"
         ),
     )
+    create_plan.add_argument(
+        "--strict-execution",
+        action="store_true",
+        help=(
+            "Enroll a strict-execution research plan: only protected C provider "
+            "provenance can submit discussion content, and only the reserved "
+            "deepseek writer may implement the frozen contract (D1)"
+        ),
+    )
     create_plan.add_argument("--json", action="store_true")
     create_plan.set_defaults(func=command_create_plan)
 
@@ -6006,6 +6509,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--round", dest="round_number", type=int, choices=(1, 2), required=True
     )
     consensus_submit.add_argument("--submission-file", required=True)
+    consensus_submit.add_argument(
+        "--source-job",
+        help=(
+            "Strict execution only: settled reserved provider job whose immutable "
+            "mapped payload is the sole source of this receipt"
+        ),
+    )
     consensus_submit.add_argument("--job-id")
     consensus_submit.add_argument("--leader")
     consensus_submit.add_argument("--retry-id")
@@ -6036,6 +6546,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--vote", required=True, choices=("AGREE", "DISAGREE", "NEEDS_DISCUSSION")
     )
     consensus_vote.add_argument("--rationale")
+    consensus_vote.add_argument(
+        "--source-job",
+        help=(
+            "Strict execution only: settled reserved provider consensus job whose "
+            "immutable payload is the sole source of this ballot"
+        ),
+    )
     consensus_vote.add_argument("--job-id")
     consensus_vote.add_argument("--leader")
     consensus_vote.add_argument("--retry-id")
@@ -6082,9 +6599,110 @@ def build_parser() -> argparse.ArgumentParser:
     consensus_new_cycle.add_argument("--authorized-by", required=True)
     consensus_new_cycle.add_argument("--authorization")
     consensus_new_cycle.add_argument("--authorization-file")
+    consensus_new_cycle.add_argument(
+        "--authorization-kind",
+        choices=("human", "coordinator"),
+        help=(
+            "Strict execution: honest authorization class. A non-unanimous cycle "
+            "requires 'human'; coordinator consensus is available only after a "
+            "successful unanimous cycle"
+        ),
+    )
     consensus_new_cycle.add_argument("--operation-id")
     consensus_new_cycle.add_argument("--json", action="store_true")
     consensus_new_cycle.set_defaults(func=command_consensus_new_cycle)
+
+    execution_discussion = subparsers.add_parser(
+        "execution-discussion",
+        help=(
+            "D1 strict execution: launch one protected readonly discussion job "
+            "for an exact role, round, cycle and step"
+        ),
+    )
+    execution_discussion.add_argument("--plan-id", required=True)
+    execution_discussion.add_argument("--step-id", required=True)
+    execution_discussion.add_argument(
+        "--role", required=True, choices=("deepseek", "glm")
+    )
+    execution_discussion.add_argument(
+        "--round", dest="round_number", type=int, choices=(1, 2, 3), required=True
+    )
+    execution_discussion.add_argument("--task-file", required=True)
+    execution_discussion.add_argument("--timeout-seconds", type=int, default=3600)
+    execution_discussion.add_argument("--config")
+    execution_discussion.add_argument("--json", action="store_true")
+    execution_discussion.set_defaults(func=command_execution_discussion)
+
+    execution_contract = subparsers.add_parser(
+        "execution-contract",
+        help=(
+            "D1 strict execution: freeze the immutable post-consensus contract "
+            "for the current candidate"
+        ),
+    )
+    execution_contract.add_argument("--plan-id", required=True)
+    execution_contract.add_argument("--step-id", required=True)
+    execution_contract.add_argument("--contract-file", required=True)
+    execution_contract.add_argument("--operation-id")
+    execution_contract.add_argument("--json", action="store_true")
+    execution_contract.set_defaults(func=command_execution_contract)
+
+    execution_implement = subparsers.add_parser(
+        "execution-implement",
+        help=(
+            "D1 strict execution: admit the reserved deepseek writer for the "
+            "frozen contract of the current candidate"
+        ),
+    )
+    execution_implement.add_argument("--plan-id", required=True)
+    execution_implement.add_argument("--step-id", required=True)
+    execution_implement.add_argument("--task-file", required=True)
+    execution_implement.add_argument("--timeout-seconds", type=int, default=3600)
+    execution_implement.add_argument("--config")
+    execution_implement.add_argument("--json", action="store_true")
+    execution_implement.set_defaults(func=command_execution_implement)
+
+    execution_finalize = subparsers.add_parser(
+        "execution-finalize",
+        help=(
+            "D1 strict execution: reconcile a settled implementation invocation "
+            "and freeze immutable attempt evidence"
+        ),
+    )
+    execution_finalize.add_argument("--plan-id", required=True)
+    execution_finalize.add_argument("--step-id", required=True)
+    execution_finalize.add_argument("--job-id")
+    execution_finalize.add_argument("--json", action="store_true")
+    execution_finalize.set_defaults(func=command_execution_finalize)
+
+    execution_continue = subparsers.add_parser(
+        "execution-continue",
+        help=(
+            "D1 strict execution: classify exact own-attempt residue and "
+            "authorize one same-attempt continuation"
+        ),
+    )
+    execution_continue.add_argument("--plan-id", required=True)
+    execution_continue.add_argument("--step-id", required=True)
+    execution_continue.add_argument("--operator", required=True)
+    execution_continue.add_argument("--authorization")
+    execution_continue.add_argument("--authorization-file")
+    execution_continue.add_argument("--json", action="store_true")
+    execution_continue.set_defaults(func=command_execution_continue)
+
+    execution_abort = subparsers.add_parser(
+        "execution-abort",
+        help=(
+            "D1 strict execution: close a provable pre-invocation no-start "
+            "without relabeling any started invocation"
+        ),
+    )
+    execution_abort.add_argument("--plan-id", required=True)
+    execution_abort.add_argument("--step-id", required=True)
+    execution_abort.add_argument("--job-id", required=True)
+    execution_abort.add_argument("--reason", required=True)
+    execution_abort.add_argument("--json", action="store_true")
+    execution_abort.set_defaults(func=command_execution_abort)
 
     metrics = subparsers.add_parser(
         "metrics", help="Aggregate recent executor outcomes and provider-reported usage"

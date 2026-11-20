@@ -1017,6 +1017,50 @@ class B1ConsensusTests(unittest.TestCase):
         )
         self.assertIn("already enrolled", legacy.stderr)
 
+    def _assert_legacy_rendering_matches(
+        self, plan_id: str, prefix: str
+    ) -> None:
+        fixtures = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "b1-legacy-render"
+        )
+        b1 = runner.b1_module()
+        state = b1.replay_events(self.plan_path(plan_id))
+        step_state = state["steps"]["step-one"]
+        step = next(
+            item
+            for item in state["static"]["manifest"]["steps"]
+            if item["id"] == "step-one"
+        )
+        snapshot = b1._cycle_snapshot(step_state, step_state["cycle"])
+        self.assertIsNone(snapshot["candidate"]["candidate"].get("execution_constraints"))
+        aggregate = b1._render_consensus(state)
+        per_step = b1._render_step_consensus(
+            state["static"],
+            step,
+            step_state["cycle"],
+            snapshot,
+            step_state,
+        )
+        self.assertEqual(
+            aggregate,
+            (fixtures / f"{prefix}-aggregate.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            per_step,
+            (fixtures / f"{prefix}-step.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_legacy_consensus_rendering_is_byte_compatible(self) -> None:
+        # Policy 2 non-strict and policy 1 archived states keep their exact
+        # historical aggregate and per-step consensus artifact bytes.
+        self.create_managed()
+        self.complete_consensus("b1-plan")
+        self._assert_legacy_rendering_matches("b1-plan", "policy2")
+        self.build_v1_ledger()
+        self._assert_legacy_rendering_matches("v1-plan", "policy1")
+
     def test_dissent_requires_human_cycle_and_preserves_settled_evidence(self) -> None:
         self.create_managed()
         digest = self.complete_consensus(
