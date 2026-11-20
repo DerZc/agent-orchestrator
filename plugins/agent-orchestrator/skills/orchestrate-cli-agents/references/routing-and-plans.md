@@ -114,6 +114,13 @@ Create one detailed task contract per checklist item. Launch with `--plan-id` an
 `--checklist-item`. Use `--depends-on` only for accepted prerequisites; the runner rejects an
 unreviewed dependency.
 
+For a research-team plan that needs a genuine three-role discussion followed by one managed
+DeepSeek implementation, enroll with `--research-team --strict-execution` and use the D1
+execution commands. D1 proves provider provenance, freezes approved constraints and a separate
+contract, binds one B2 writer lease, and stops at `IMPLEMENTATION_COMPLETE`; review, repair,
+validation execution, PR/CI/merge and dependency opening remain closed. See
+[d-managed-execution.md](d-managed-execution.md).
+
 The plan records `team_policy`. `auto` becomes a single worker for small, coupled, or
 judgment-heavy work and a cross-harness team for two or more safely isolated roles. In
 `cross-harness`, keep each worker as a top-level runner job and assign exact CLI/model, role, path

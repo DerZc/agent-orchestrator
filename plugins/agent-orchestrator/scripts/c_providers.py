@@ -33,7 +33,9 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -54,6 +56,173 @@ READONLY_OPERATIONS = ("proposal", "cross_examination", "consensus")
 WRITER_OPERATIONS = ("implementation", "repair")
 
 PROVIDERS = ("deepseek", "glm")
+
+# D1 protection seam.  These inputs are optional and typed: an empty default
+# preserves the historical provider argv byte-for-byte, while a protected D1
+# writer supplies workspace-relative original-user roots and their ancestor
+# anchors.  C owns validation, mount ordering and the resulting evidence; a
+# transport shim or writer report can never supply this proof.
+PROTECTION_INPUT_VERSION = 1
+MAX_PROTECTION_ROOTS = 256
+MAX_PROTECTION_ANCHORS = 1_024
+MAX_EXTRA_MOUNT_ARGV_BYTES = 128 * 1024
+MAX_MOUNTINFO_BYTES = 4 * 1024 * 1024
+MAX_CONFINEMENT_STATUS_BYTES = 4_096
+
+CONFINEMENT_CHECK_SCRIPT = r"""import json
+import os
+import sys
+
+nonce = sys.argv[1]
+status_fd = int(sys.argv[2])
+try:
+    checks = json.loads(sys.argv[3])
+except Exception:
+    try:
+        os.write(
+            status_fd,
+            ("C1CONF %s FAIL invalid-check-payload\n" % nonce).encode("utf-8"),
+        )
+    except OSError:
+        pass
+    raise SystemExit(1)
+command = sys.argv[4:]
+
+
+def _unescape(value):
+    result = bytearray()
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 3 < len(value) + 1:
+            octal = value[index + 1 : index + 4]
+            if len(octal) == 3 and all(item in "01234567" for item in octal):
+                result.append(int(octal, 8))
+                index += 4
+                continue
+        result.extend(char.encode("utf-8", "surrogateescape"))
+        index += 1
+    return result.decode("utf-8", "surrogateescape")
+
+
+def _report(ok, detail):
+    line = "C1CONF %s %s %s\n" % (
+        nonce,
+        "OK" if ok else "FAIL",
+        detail.replace("\n", " ")[:400],
+    )
+    try:
+        os.write(status_fd, line.encode("utf-8", "replace"))
+    except OSError:
+        pass
+    if not ok:
+        os._exit(1)
+
+
+try:
+    with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as handle:
+        mountinfo = handle.read(4 * 1024 * 1024 + 1)
+    if len(mountinfo) > 4 * 1024 * 1024:
+        _report(False, "mountinfo exceeds its bounded size")
+        raise SystemExit(1)
+except Exception as exc:
+    _report(False, "check input unavailable: " + type(exc).__name__)
+    raise SystemExit(1)
+
+mounts = {}
+for line in mountinfo.splitlines():
+    fields = line.split(" ")
+    if len(fields) < 6:
+        continue
+    try:
+        mount_id = int(fields[0])
+    except ValueError:
+        continue
+    mountpoint = _unescape(fields[4])
+    mounts.setdefault(mountpoint, []).append((mount_id, fields[5]))
+
+
+def mount_options(path):
+    entries = mounts.get(path)
+    if not entries:
+        return None, "missing"
+    if len(entries) != 1:
+        # The plan mounts each declared path exactly once.  Multiple entries
+        # mean an unexpected overmount topology that cannot be attested
+        # without inventing ordering assumptions; fail closed instead.
+        return None, "duplicate"
+    return entries[0][1], None
+
+
+errors = []
+checked = 0
+for root in checks.get("roots") or []:
+    checked += 1
+    options, problem = mount_options(root["path"])
+    if problem == "missing":
+        errors.append("protected root is not a private mount: " + root["path"])
+    elif problem == "duplicate":
+        errors.append("protected root has ambiguous overmounts: " + root["path"])
+    elif "ro" not in options.split(","):
+        errors.append("protected root is not read-only: " + root["path"])
+    if root.get("kind") == "directory":
+        prefix = root["path"].rstrip("/") + "/"
+        for mountpoint, entries in mounts.items():
+            if mountpoint.startswith(prefix):
+                for _mount_id, options in entries:
+                    if "ro" not in options.split(","):
+                        errors.append(
+                            "writable mount inside protected root: " + mountpoint
+                        )
+                        break
+for entry in checks.get("anchors") or []:
+    checked += 1
+    options, problem = mount_options(entry["path"])
+    if problem == "missing":
+        errors.append("ancestor anchor is not a private mount: " + entry["path"])
+    elif problem == "duplicate":
+        errors.append("ancestor anchor has ambiguous overmounts: " + entry["path"])
+    elif "ro" in options.split(","):
+        errors.append("ancestor anchor was remounted read-only: " + entry["path"])
+for role, path in (
+    ("workspace", checks.get("workspace")),
+    ("scratch", checks.get("scratch")),
+    ("channel", checks.get("channel")),
+):
+    if not path:
+        continue
+    checked += 1
+    options, problem = mount_options(path)
+    if problem == "missing":
+        errors.append(role + " is not writable inside the sandbox: " + path)
+    elif problem == "duplicate":
+        errors.append(role + " has ambiguous overmounts: " + path)
+    elif "ro" in options.split(","):
+        errors.append(role + " is read-only inside the sandbox: " + path)
+for path in checks.get("git") or []:
+    checked += 1
+    options, problem = mount_options(path)
+    if problem == "missing":
+        errors.append("Git custody path is not a private mount: " + path)
+    elif problem == "duplicate":
+        errors.append("Git custody path has ambiguous overmounts: " + path)
+    elif "ro" not in options.split(","):
+        errors.append("Git custody path is not read-only: " + path)
+
+if errors:
+    _report(False, "; ".join(errors[:4]))
+    raise SystemExit(1)
+_report(True, str(checked))
+try:
+    os.close(status_fd)
+except OSError:
+    pass
+try:
+    os.execv(command[0], command)
+except OSError as exc:
+    _report(False, "provider command unavailable: " + type(exc).__name__)
+raise SystemExit(1)
+"""
 
 # This table is the only authority C introduces.  Reserved profile names are
 # fixed; configuration may choose the Bash startup context but cannot widen an
@@ -550,6 +719,23 @@ exit $status
 PROBE_SCRIPT = r"""if builtin declare -F "$1" >/dev/null 2>&1; then exit 0; fi
 exit 90
 """
+
+# The probe script is the only code that exits with this marker.  A different
+# nonzero status means bubblewrap or Bash failed before the availability check
+# ran (for example bwrap --chdir EACCES), which must not be reported as a
+# missing provider function.
+PROBE_MISSING_FUNCTION_EXIT = 90
+PROBE_MISSING_FUNCTION_REASON = (
+    "the reserved provider Bash function is not available in the configured context"
+)
+PROBE_STARTUP_FAILURE_REASON = (
+    "the provider Bash probe could not start inside the isolation sandbox "
+    "before the availability check (isolation or Bash startup failure)"
+)
+PROBE_TIMEOUT_REASON = (
+    "the isolated provider Bash availability probe exceeded its bounded timeout"
+)
+PROBE_EXECUTION_REASON = "provider Bash availability probe could not execute"
 
 
 def _parse_error() -> ProviderError:
@@ -1499,6 +1685,408 @@ def isolation_status() -> tuple[bool, str | None]:
     return True, None
 
 
+def _protection_parts(value: Any, label: str) -> list[str]:
+    if not isinstance(value, str) or not value:
+        raise ProviderError(
+            "isolation_unavailable", f"{label} must be a workspace-relative path"
+        )
+    if "\x00" in value or value.startswith("/") or "\\" in value:
+        raise ProviderError(
+            "isolation_unavailable", f"{label} must be a relative path"
+        )
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ProviderError(
+            "isolation_unavailable", f"{label} must not escape the workspace"
+        )
+    if parts[0] == ".git":
+        raise ProviderError(
+            "isolation_unavailable", f"{label} must not target Git metadata"
+        )
+    return parts
+
+
+def _protection_entry(
+    workspace_real: Path,
+    parts: list[str],
+    label: str,
+    *,
+    expected_kind: str | None = None,
+) -> dict[str, Any]:
+    current = workspace_real
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError as exc:
+            raise ProviderError(
+                "isolation_unavailable", f"{label} does not exist"
+            ) from exc
+        except OSError as exc:
+            raise ProviderError(
+                "isolation_unavailable", f"{label} cannot be inspected: {exc}"
+            ) from exc
+        if stat_is_symlink(info.st_mode):
+            raise ProviderError(
+                "isolation_unavailable",
+                f"{label} traverses or names a symlink, which cannot be pinned safely",
+            )
+        if index < len(parts) - 1 and not stat_is_dir(info.st_mode):
+            raise ProviderError(
+                "isolation_unavailable", f"{label} has a non-directory ancestor"
+            )
+    is_directory = stat_is_dir(info.st_mode)
+    is_file = stat_is_file(info.st_mode)
+    if not is_directory and not is_file:
+        raise ProviderError(
+            "isolation_unavailable",
+            f"{label} is not a regular file or directory",
+        )
+    kind = "directory" if is_directory else "file"
+    if expected_kind is not None and kind != expected_kind:
+        raise ProviderError(
+            "isolation_unavailable", f"{label} changed type before protection"
+        )
+    return {
+        "path": "/".join(parts),
+        "absolute": str(current),
+        "kind": kind,
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def stat_is_symlink(mode: int) -> bool:
+    return stat.S_ISLNK(mode)
+
+
+def stat_is_dir(mode: int) -> bool:
+    return stat.S_ISDIR(mode)
+
+
+def stat_is_file(mode: int) -> bool:
+    return stat.S_ISREG(mode)
+
+
+class _NormalizedProtection(dict):
+    """Private marker for a plan that passed C's typed validation.
+
+    Serialized or caller-supplied mappings can never instantiate this class,
+    so a forged ``plan_sha256`` key cannot bypass normalization.
+    """
+
+    __slots__ = ()
+
+
+def normalize_protection(
+    workspace: Path,
+    protection: Mapping[str, Any] | None,
+    *,
+    capability: str,
+    scratch: Path | None = None,
+    channel: Path | None = None,
+    git_dir: Path | None = None,
+    git_common_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Validate typed D1 protection inputs and normalize their mount order.
+
+    The caller supplies only repository-relative original-user roots and the
+    normal-directory ancestors that must stay pinned.  C is the sole authority
+    for the resulting absolute mount plan, ordering and evidence.  Symlinked,
+    special, escaping or Git/metadata-colliding paths are refused rather than
+    resolved.
+    """
+    if protection is None:
+        return None
+    if not isinstance(protection, Mapping):
+        raise ProviderError(
+            "isolation_unavailable", "protected execution inputs must be an object"
+        )
+    if set(protection) != {
+        "version",
+        "manifest_sha256",
+        "roots",
+        "anchors",
+    }:
+        raise ProviderError(
+            "isolation_unavailable",
+            "protected execution inputs have an unsupported schema",
+        )
+    if protection.get("version") != PROTECTION_INPUT_VERSION:
+        raise ProviderError(
+            "isolation_unavailable",
+            "protected execution input version is not supported",
+        )
+    manifest = protection.get("manifest_sha256")
+    if not isinstance(manifest, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest):
+        raise ProviderError(
+            "isolation_unavailable",
+            "protected execution input has no valid manifest digest",
+        )
+    workspace_text = str(workspace)
+    workspace_real = Path(os.path.realpath(workspace))
+    if str(workspace_real) == "/":
+        raise ProviderError(
+            "isolation_unavailable", "the repository root cannot be protected"
+        )
+    if workspace_text != str(workspace_real):
+        raise ProviderError(
+            "isolation_unavailable",
+            "protected execution requires the canonical workspace path",
+        )
+    roots_raw = protection.get("roots")
+    anchors_raw = protection.get("anchors")
+    if not isinstance(roots_raw, list) or not isinstance(anchors_raw, list):
+        raise ProviderError(
+            "isolation_unavailable",
+            "protected execution roots and anchors must be arrays",
+        )
+    if len(roots_raw) > MAX_PROTECTION_ROOTS:
+        raise ProviderError(
+            "isolation_unavailable",
+            f"protected execution exceeds {MAX_PROTECTION_ROOTS} roots",
+        )
+    if len(anchors_raw) > MAX_PROTECTION_ANCHORS:
+        raise ProviderError(
+            "isolation_unavailable",
+            f"protected execution exceeds {MAX_PROTECTION_ANCHORS} anchors",
+        )
+    if capability == "readonly" and anchors_raw:
+        raise ProviderError(
+            "isolation_unavailable",
+            "readonly capability cannot accept writable ancestor anchors",
+        )
+    roots: list[dict[str, Any]] = []
+    for index, raw in enumerate(roots_raw):
+        label = f"protected root {index}"
+        if not isinstance(raw, Mapping) or set(raw) != {"path", "kind"}:
+            raise ProviderError(
+                "isolation_unavailable",
+                f"{label} has an unsupported schema",
+            )
+        kind = raw.get("kind")
+        if kind not in {"file", "directory"}:
+            raise ProviderError(
+                "isolation_unavailable", f"{label} has an unsupported kind"
+            )
+        entry = _protection_entry(
+            workspace_real,
+            _protection_parts(raw.get("path"), label),
+            label,
+            expected_kind=kind,
+        )
+        entry["declared_kind"] = kind
+        roots.append(entry)
+    anchors: list[dict[str, Any]] = []
+    seen_anchors: set[str] = set()
+    for index, raw in enumerate(anchors_raw):
+        label = f"ancestor anchor {index}"
+        if not isinstance(raw, Mapping) or set(raw) != {"path"}:
+            raise ProviderError(
+                "isolation_unavailable",
+                f"{label} has an unsupported schema",
+            )
+        entry = _protection_entry(
+            workspace_real,
+            _protection_parts(raw.get("path"), label),
+            label,
+            expected_kind="directory",
+        )
+        if entry["absolute"] in seen_anchors:
+            raise ProviderError(
+                "isolation_unavailable", f"{label} is duplicated"
+            )
+        seen_anchors.add(entry["absolute"])
+        anchors.append(entry)
+    root_paths = [entry["path"] for entry in roots]
+    if len(set(root_paths)) != len(root_paths):
+        raise ProviderError(
+            "isolation_unavailable", "protected roots repeat a path"
+        )
+    root_absolute = {entry["absolute"] for entry in roots}
+    directory_roots = [
+        entry["absolute"] for entry in roots if entry["kind"] == "directory"
+    ]
+    for root in root_paths:
+        for other in root_paths:
+            if root == other:
+                continue
+            if root.startswith(other + "/"):
+                raise ProviderError(
+                    "isolation_unavailable",
+                    "protected roots are nested; refine them before protection",
+                )
+    for anchor in anchors:
+        absolute = anchor["absolute"]
+        if absolute in root_absolute:
+            raise ProviderError(
+                "isolation_unavailable",
+                "an ancestor anchor collides with a protected root",
+            )
+        for root in directory_roots:
+            if absolute.startswith(root.rstrip("/") + "/"):
+                raise ProviderError(
+                    "isolation_unavailable",
+                    "an ancestor anchor is inside a protected read-only root",
+                )
+        if not any(
+            root.startswith(anchor["path"] + "/") for root in root_paths
+        ):
+            raise ProviderError(
+                "isolation_unavailable",
+                "an ancestor anchor does not pin any protected path",
+            )
+    for path, label in (
+        (workspace_real / ".git", "Git marker"),
+        (
+            Path(os.path.realpath(git_dir)) if git_dir is not None else None,
+            "Git administrative directory",
+        ),
+        (
+            Path(os.path.realpath(git_common_dir))
+            if git_common_dir is not None
+            else None,
+            "Git common directory",
+        ),
+    ):
+        if path is None:
+            continue
+        path_text = str(path)
+        for entry in roots + anchors:
+            absolute = entry["absolute"]
+            if absolute == path_text or absolute.startswith(
+                path_text.rstrip("/") + "/"
+            ):
+                raise ProviderError(
+                    "isolation_unavailable",
+                    f"protected execution collides with the {label}",
+                )
+            if path_text.startswith(absolute.rstrip("/") + "/") and entry in roots:
+                raise ProviderError(
+                    "isolation_unavailable",
+                    f"a protected root contains the {label}",
+                )
+    extra_argv_bytes = 0
+    for entry in roots:
+        raw = os.fsencode(entry["absolute"])
+        extra_argv_bytes += len(b"--ro-bind") + 1 + 2 * (len(raw) + 1)
+    for entry in anchors:
+        raw = os.fsencode(entry["absolute"])
+        extra_argv_bytes += len(b"--bind") + 1 + 2 * (len(raw) + 1)
+    if extra_argv_bytes > MAX_EXTRA_MOUNT_ARGV_BYTES:
+        raise ProviderError(
+            "isolation_unavailable",
+            "protected execution exceeds the encoded extra mount argv bound",
+        )
+    anchors.sort(key=lambda item: (item["path"].count("/"), item["path"]))
+    roots.sort(key=lambda item: item["path"])
+    normalized = _NormalizedProtection(
+        {
+            "version": PROTECTION_INPUT_VERSION,
+            "manifest_sha256": manifest,
+            "capability": capability,
+            "workspace": workspace_text,
+            "roots": roots,
+            "anchors": anchors,
+            "extra_mount_argv_bytes": extra_argv_bytes,
+        }
+    )
+    normalized["plan_sha256"] = _protection_plan_sha256(normalized)
+    return normalized
+
+
+def _protection_mounts(
+    normalized: Mapping[str, Any] | None,
+    workspace_text: str,
+    *,
+    capability: str,
+    scratch: Path | None,
+    channel: Path | None,
+    git_paths: list[str],
+) -> list[list[str]]:
+    entries: list[list[str]] = [
+        ["ro-bind", "/", "/"],
+        ["dev", "/dev"],
+        ["proc", "/proc"],
+    ]
+    if normalized is None:
+        if capability == "workspace_write":
+            if scratch is None or channel is None:
+                raise ProviderError(
+                    "isolation_unavailable",
+                    "writer scratch and channel paths are required",
+                )
+            entries.append(["bind", workspace_text, workspace_text])
+            entries.extend(
+                ["ro-bind", path, path] for path in git_paths
+            )
+            entries.extend(
+                [
+                    ["bind", str(scratch), str(scratch)],
+                    ["bind", str(channel), str(channel)],
+                ]
+            )
+        return entries
+    if capability == "workspace_write":
+        if scratch is None or channel is None:
+            raise ProviderError(
+                "isolation_unavailable",
+                "writer scratch and channel paths are required",
+            )
+        entries.append(["bind", workspace_text, workspace_text])
+        entries.extend(
+            ["bind", entry["absolute"], entry["absolute"]]
+            for entry in normalized["anchors"]
+        )
+        entries.extend(["ro-bind", path, path] for path in git_paths)
+        entries.extend(
+            ["ro-bind", entry["absolute"], entry["absolute"]]
+            for entry in normalized["roots"]
+        )
+        entries.append(["bind", str(scratch), str(scratch)])
+        entries.append(["bind", str(channel), str(channel)])
+    else:
+        entries.extend(
+            ["ro-bind", entry["absolute"], entry["absolute"]]
+            for entry in normalized["roots"]
+        )
+    return entries
+
+
+def _protection_plan_sha256(normalized: Mapping[str, Any]) -> str:
+    plan = {
+        "version": normalized["version"],
+        "manifest_sha256": normalized["manifest_sha256"],
+        "capability": normalized["capability"],
+        "workspace": normalized["workspace"],
+        "roots": [
+            {"path": entry["path"], "kind": entry["kind"]}
+            for entry in normalized["roots"]
+        ],
+        "anchors": [entry["path"] for entry in normalized["anchors"]],
+        "extra_mount_argv_bytes": normalized["extra_mount_argv_bytes"],
+    }
+    return hashlib.sha256(_canonical_bytes(plan)).hexdigest()
+
+
+def _git_custody_paths(
+    workspace_text: str,
+    git_dir: Path | None,
+    git_common_dir: Path | None,
+) -> list[str]:
+    protected: list[str] = []
+    git_marker = Path(workspace_text) / ".git"
+    if os.path.lexists(git_marker):
+        protected.append(str(git_marker))
+    for path in (git_dir, git_common_dir):
+        if path is not None:
+            text = str(path)
+            if text not in protected:
+                protected.append(text)
+    return protected
+
+
 def bwrap_command(
     workspace: Path,
     capability: str,
@@ -1508,6 +2096,7 @@ def bwrap_command(
     channel: Path | None = None,
     git_dir: Path | None = None,
     git_common_dir: Path | None = None,
+    protection: Mapping[str, Any] | None = None,
 ) -> list[str]:
     bwrap = bwrap_executable()
     if not bwrap:
@@ -1517,12 +2106,85 @@ def bwrap_command(
         raise ProviderError(
             "isolation_unavailable", "the repository root cannot be isolated as a workspace"
         )
+    if protection is not None and not isinstance(
+        protection, _NormalizedProtection
+    ):
+        # A raw mapping is always revalidated here, even if it claims a
+        # plan_sha256 marker; the private class cannot be forged from JSON.
+        protection = normalize_protection(
+            workspace,
+            protection,
+            capability=capability,
+            scratch=scratch,
+            channel=channel,
+            git_dir=git_dir,
+            git_common_dir=git_common_dir,
+        )
+    git_paths = _git_custody_paths(
+        workspace_text, git_dir, git_common_dir
+    )
     command = [
         bwrap,
         "--die-with-parent",
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
+        "--cap-drop",
+        "ALL",
+    ]
+    command.extend(
+        entry for mount in _protection_mounts(
+            protection,
+            workspace_text,
+            capability=capability,
+            scratch=scratch,
+            channel=channel,
+            git_paths=git_paths,
+        ) for entry in (["--" + mount[0], *mount[1:]])
+    )
+    command.extend(["--chdir", workspace_text])
+    command.extend(shell_argv)
+    return command
+
+
+def probe_provider(
+    profile: Mapping[str, Any],
+    timeout_seconds: float = 20,
+    *,
+    workspace: Path | None = None,
+) -> tuple[bool, str | None]:
+    """Availability-only probe in the configured interactive Bash context.
+
+    Reserved-provider startup is never executed unconfined: bubblewrap
+    establishes the read-only root before the rcfile is loaded, and the probe
+    unshares the network namespace so an availability check cannot reach a
+    provider model or consume quota.  The function itself is only inspected
+    with ``declare -F``; no provider dispatch occurs.
+
+    The boolean/reason tuple is unchanged.  The reason distinguishes three
+    failure categories without surfacing captured startup output: the probe
+    script's explicit missing-function exit marker, a bounded timeout, and a
+    pre-start isolation/Bash-startup failure where bubblewrap or Bash never
+    reached the probe script.
+    """
+    name = profile.get("provider")
+    if not is_reserved_provider(name):
+        return False, "not a reserved provider"
+    bwrap = bwrap_executable()
+    if not bwrap:
+        return False, "bubblewrap (bwrap) is required for availability probes"
+    shell = [bash_executable()]
+    rcfile = profile.get("provider_rcfile")
+    if rcfile:
+        shell.extend(["--rcfile", str(rcfile)])
+    shell.extend(["-ic", PROBE_SCRIPT, "c-probe", str(name)])
+    command = [
+        bwrap,
+        "--die-with-parent",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-net",
         "--cap-drop",
         "ALL",
         "--ro-bind",
@@ -1533,55 +2195,11 @@ def bwrap_command(
         "--proc",
         "/proc",
     ]
-    if capability == "workspace_write":
-        if scratch is None or channel is None:
-            raise ProviderError(
-                "isolation_unavailable", "writer scratch and channel paths are required"
-            )
-        command.extend(["--bind", workspace_text, workspace_text])
-        # A linked worktree keeps ``.git`` as a regular marker file inside the
-        # writable worktree pointing at the shared administrative directory.
-        # The marker must be remounted read-only after the workspace bind in
-        # addition to the resolved administrative directories; otherwise the
-        # whole worktree bind leaves it writable.
-        protected: list[str] = []
-        git_marker = Path(workspace_text) / ".git"
-        if os.path.lexists(git_marker):
-            protected.append(str(git_marker))
-        for path in (git_dir, git_common_dir):
-            if path is not None:
-                text = str(path)
-                if text not in protected:
-                    protected.append(text)
-        for text in protected:
-            command.extend(["--ro-bind", text, text])
-        command.extend(
-            [
-                "--bind",
-                str(scratch),
-                str(scratch),
-                "--bind",
-                str(channel),
-                str(channel),
-            ]
-        )
-    command.extend(["--chdir", workspace_text])
-    command.extend(shell_argv)
-    return command
-
-
-def probe_provider(
-    profile: Mapping[str, Any], timeout_seconds: float = 20
-) -> tuple[bool, str | None]:
-    """Availability-only probe in the configured interactive Bash context."""
-    name = profile.get("provider")
-    if not is_reserved_provider(name):
-        return False, "not a reserved provider"
-    command = [bash_executable()]
-    rcfile = profile.get("provider_rcfile")
-    if rcfile:
-        command.extend(["--rcfile", str(rcfile)])
-    command.extend(["-ic", PROBE_SCRIPT, "c-probe", str(name)])
+    if workspace is not None:
+        workspace_path = Path(workspace).expanduser()
+        if workspace_path.is_dir() and not workspace_path.is_symlink():
+            command.extend(["--chdir", str(workspace_path.resolve())])
+    command.extend(shell)
     try:
         completed = subprocess.run(
             command,
@@ -1591,14 +2209,18 @@ def probe_provider(
             timeout=timeout_seconds,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False, "provider Bash availability probe could not execute"
-    if completed.returncode != 0:
-        return (
-            False,
-            "the reserved provider Bash function is not available in the configured context",
-        )
-    return True, None
+    except subprocess.TimeoutExpired:
+        return False, PROBE_TIMEOUT_REASON
+    except OSError:
+        return False, PROBE_EXECUTION_REASON
+    if completed.returncode == 0:
+        return True, None
+    if completed.returncode == PROBE_MISSING_FUNCTION_EXIT:
+        return False, PROBE_MISSING_FUNCTION_REASON
+    # bubblewrap can fail before the probe script runs (for example a
+    # restricted ancestor making --chdir fail with EACCES), and Bash startup
+    # can fail while loading the rcfile.  Neither proves the function absent.
+    return False, PROBE_STARTUP_FAILURE_REASON
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -2296,6 +2918,62 @@ def _sanitized_diagnostic_tail(data: bytes) -> str | None:
     return tail.decode("utf-8", errors="replace")
 
 
+def _read_confinement_status(
+    fd: int,
+    deadline: float,
+    cancel_marker: Path | None = None,
+) -> tuple[bytes | None, str | None]:
+    data = bytearray()
+    while b"\n" not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # The whole-run deadline is authoritative over a missing status,
+            # matching the canonical timeout-before-cancel precedence.
+            return None, "timeout"
+        if cancel_marker is not None and cancel_marker.exists():
+            return None, "cancelled"
+        try:
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.1))
+        except (OSError, ValueError):
+            return None, "the confinement status channel was unreadable"
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            return None, "the confinement status channel was unreadable"
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > MAX_CONFINEMENT_STATUS_BYTES:
+            return None, "the confinement status exceeded its size bound"
+    if not data:
+        return None, "the confinement status channel closed without evidence"
+    return bytes(data).split(b"\n", 1)[0], None
+
+
+def _confinement_evidence(
+    normalized: Mapping[str, Any],
+    command: list[str],
+    application: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "manifest_sha256": normalized["manifest_sha256"],
+        "plan_sha256": normalized["plan_sha256"],
+        "capability": normalized["capability"],
+        "counts": {
+            "protected_roots": len(normalized["roots"]),
+            "ancestor_anchors": len(normalized["anchors"]),
+            "extra_mount_argv_bytes": normalized["extra_mount_argv_bytes"],
+        },
+        "bwrap_argv_sha256": hashlib.sha256(
+            _canonical_bytes(list(command))
+        ).hexdigest(),
+        "application": dict(application),
+    }
+
+
 def run_provider(
     *,
     profile: Mapping[str, Any],
@@ -2314,8 +2992,17 @@ def run_provider(
     on_heartbeat: Callable[[dict[str, Any]], None] | None = None,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     scope_check: Callable[[], list[str]] | None = None,
+    protection: Mapping[str, Any] | None = None,
 ) -> ProviderRun:
-    """Run one reserved provider under bwrap and return sanitized evidence."""
+    """Run one reserved provider under bwrap and return sanitized evidence.
+
+    ``protection`` is the optional typed D1 seam: workspace-relative original
+    protected-user roots and their normal-directory ancestor anchors.  Empty
+    defaults preserve the historical argv exactly.  When roots are declared, C
+    runs a read-only/mount-identity self-check inside the claimed namespace
+    before the provider rcfile is loaded and refuses to start the provider if
+    the requested confinement was not actually applied.
+    """
     operation = str(binding.get("operation"))
     capability = str(binding.get("capability"))
     if binding.get("provider") != profile.get("provider"):
@@ -2344,6 +3031,15 @@ def run_provider(
                 "isolation_unavailable",
                 "the provider rcfile must stay outside the writable workspace",
             )
+    normalized_protection = normalize_protection(
+        workspace,
+        protection,
+        capability=capability,
+        scratch=scratch,
+        channel=channel,
+        git_dir=git_dir,
+        git_common_dir=git_common_dir,
+    )
     isolation_ok, isolation_reason = isolation_status()
     if not isolation_ok:
         error = ProviderError(
@@ -2406,6 +3102,13 @@ def run_provider(
     exit_code = 127
     redactor = Redactor(())
     child_pid: int | None = None
+    confinement: dict[str, Any] | None = None
+    confinement_status_read: int | None = None
+    confinement_status_write: int | None = None
+    confinement_nonce: str | None = None
+    confinement_status_line: bytes | None = None
+    confinement_application: dict[str, Any] | None = None
+    command: list[str] | None = None
 
     def capture_control_reason() -> str | None:
         # The deadline is authoritative before cancellation so a simultaneous
@@ -2440,15 +3143,60 @@ def run_provider(
             shell_argv = shell_command(
                 profile, prompt_file, control_fd, provider_arguments
             )
+            payload_argv = shell_argv
+            if (
+                normalized_protection is not None
+                and normalized_protection["roots"]
+            ):
+                checks = {
+                    "workspace": str(workspace),
+                    "roots": [
+                        {
+                            "path": entry["absolute"],
+                            "kind": entry["kind"],
+                        }
+                        for entry in normalized_protection["roots"]
+                    ],
+                    "anchors": [
+                        {"path": entry["absolute"]}
+                        for entry in normalized_protection["anchors"]
+                    ],
+                    "scratch": str(scratch),
+                    "channel": str(channel),
+                    "git": _git_custody_paths(
+                        str(workspace), git_dir, git_common_dir
+                    ),
+                }
+                confinement_status_read, confinement_status_write = os.pipe()
+                confinement_nonce = os.urandom(16).hex()
+                payload_argv = [
+                    bash_executable(),
+                    "-c",
+                    'exec "$0" "$@"',
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    CONFINEMENT_CHECK_SCRIPT,
+                    confinement_nonce,
+                    str(confinement_status_write),
+                    json.dumps(
+                        checks, sort_keys=True, separators=(",", ":")
+                    ),
+                    *shell_argv,
+                ]
             command = bwrap_command(
                 workspace,
                 capability,
-                shell_argv,
+                payload_argv,
                 scratch=scratch,
                 channel=channel,
                 git_dir=git_dir,
                 git_common_dir=git_common_dir,
+                protection=normalized_protection,
             )
+            pass_fds = [control_fd]
+            if confinement_status_write is not None:
+                pass_fds.append(confinement_status_write)
             process = subprocess.Popen(
                 command,
                 cwd=str(workspace),
@@ -2457,11 +3205,123 @@ def run_provider(
                 stderr=stderr_write,
                 start_new_session=True,
                 close_fds=True,
-                pass_fds=(control_fd,),
+                pass_fds=tuple(pass_fds),
             )
             child_pid = process.pid
             if on_spawn is not None:
                 on_spawn(child_pid)
+            if normalized_protection is not None:
+                if normalized_protection["roots"]:
+                    assert confinement_status_read is not None
+                    status_line, status_problem = _read_confinement_status(
+                        confinement_status_read,
+                        min(deadline, time.monotonic() + 15.0),
+                        cancel_marker=cancel_marker,
+                    )
+                    confinement_status_line = status_line
+                    expected_prefix = (
+                        "C1CONF " + str(confinement_nonce) + " OK "
+                    ).encode("ascii")
+                    # C-R1 precedence remains authoritative: a whole-run
+                    # deadline or cancellation wins over a missing/failed
+                    # confinement status, and cancellation interrupts the wait.
+                    control_reason = capture_control_reason()
+                    if control_reason is not None:
+                        apply_capture_control(control_reason)
+                    elif status_problem is not None:
+                        confinement_application = {
+                            "method": "in-namespace-mountinfo",
+                            "verified": False,
+                            "checked": 0,
+                            "nonce_sha256": hashlib.sha256(
+                                str(confinement_nonce).encode("ascii")
+                            ).hexdigest(),
+                            "errors": [
+                                "confinement status was not reported: "
+                                + status_problem
+                            ],
+                        }
+                        capture_error = ProviderError(
+                            "isolation_unavailable",
+                            "protected confinement was not established before "
+                            "provider startup: " + status_problem,
+                        )
+                    elif not status_line.startswith(expected_prefix):
+                        detail = status_line.decode("utf-8", "replace")[:400]
+                        confinement_application = {
+                            "method": "in-namespace-mountinfo",
+                            "verified": False,
+                            "checked": 0,
+                            "nonce_sha256": hashlib.sha256(
+                                str(confinement_nonce).encode("ascii")
+                            ).hexdigest(),
+                            "errors": [detail],
+                        }
+                        capture_error = ProviderError(
+                            "isolation_unavailable",
+                            "protected confinement check failed before provider "
+                            "startup: " + detail,
+                        )
+                    else:
+                        try:
+                            checked = int(
+                                status_line[len(expected_prefix) :].decode("ascii")
+                            )
+                        except (UnicodeDecodeError, ValueError):
+                            checked = -1
+                        expected_checks = (
+                            len(normalized_protection["roots"])
+                            + len(normalized_protection["anchors"])
+                            + 3
+                            + len(
+                                _git_custody_paths(
+                                    str(workspace), git_dir, git_common_dir
+                                )
+                            )
+                        )
+                        if checked < expected_checks:
+                            confinement_application = {
+                                "method": "in-namespace-mountinfo",
+                                "verified": False,
+                                "checked": max(checked, 0),
+                                "nonce_sha256": hashlib.sha256(
+                                    str(confinement_nonce).encode("ascii")
+                                ).hexdigest(),
+                                "errors": [
+                                    "confinement check covered "
+                                    f"{checked} of {expected_checks} declared mounts"
+                                ],
+                            }
+                            capture_error = ProviderError(
+                                "isolation_unavailable",
+                                "protected confinement check did not verify the "
+                                "complete declared mount plan",
+                            )
+                        else:
+                            confinement_application = {
+                                "method": "in-namespace-mountinfo",
+                                "verified": True,
+                                "checked": checked,
+                                "nonce_sha256": hashlib.sha256(
+                                    str(confinement_nonce).encode("ascii")
+                                ).hexdigest(),
+                                "status_sha256": hashlib.sha256(
+                                    status_line
+                                ).hexdigest(),
+                                "errors": [],
+                            }
+                else:
+                    confinement_application = {
+                        "method": "empty-protected-set",
+                        "verified": True,
+                        "checked": 0,
+                        "errors": [],
+                        "coverage": (
+                            "no original protected-user roots or ancestor anchors "
+                            "were declared for this attempt; the empty set carries "
+                            "no kernel protection claim"
+                        ),
+                    }
         except ProviderError as exc:
             capture_error = exc
         except (OSError, ValueError):
@@ -2473,6 +3333,20 @@ def run_provider(
             child_control.close()
             _close(stdout_write)
             _close(stderr_write)
+            _close(confinement_status_write)
+            if confinement_status_read is not None:
+                # The status record must be the first line.  Any later writer
+                # inherits a descriptor with no reader and cannot alter it.
+                try:
+                    os.close(confinement_status_read)
+                except OSError:
+                    pass
+            if normalized_protection is not None and confinement_application is not None:
+                confinement = _confinement_evidence(
+                    normalized_protection,
+                    command or [],
+                    confinement_application,
+                )
 
         if process is not None:
             stdout_thread = threading.Thread(
@@ -2714,6 +3588,7 @@ def run_provider(
         payload=payload,
         payload_sha256=payload_sha256,
         diagnostics=diagnostics,
+        confinement=confinement,
     )
     return ProviderRun(
         exit_code=exit_code,
@@ -2745,8 +3620,9 @@ def _provider_result(
     payload: dict[str, Any] | None,
     payload_sha256: str | None,
     diagnostics: dict[str, Any],
+    confinement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "result_version": RESULT_VERSION,
         "provider": binding.get("provider"),
         "profile": binding.get("profile"),
@@ -2770,6 +3646,9 @@ def _provider_result(
         "diagnostics": diagnostics,
         "captured_at": _now(),
     }
+    if confinement is not None:
+        result["confinement"] = dict(confinement)
+    return result
 
 
 def error_result(

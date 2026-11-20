@@ -121,6 +121,19 @@ MAX_LIST_ITEMS = 20
 MAX_STEPS = 50
 MAX_STEP_BYTES = 16_384
 
+# D1 managed execution. These constants extend the discussion schema only when
+# a plan was enrolled in strict execution mode; historical and legacy ledgers
+# never contain them and therefore keep their exact original bytes and digests.
+STRICT_EXECUTION_KEY = "strict_execution"
+EXECUTION_CONSTRAINTS_VERSION = 1
+MAX_CONSTRAINT_PATTERNS = 64
+MAX_CONSTRAINT_CRITERIA = 50
+MAX_VALIDATION_COMMANDS = 32
+MAX_VALIDATION_ARGV = 64
+MAX_VALIDATION_ARG_BYTES = 4_096
+MAX_PATTERN_BYTES = 4_096
+CRITERION_ID_RE = re.compile(r"^C[0-9]{3}$")
+
 ZERO_DIGEST = "0" * 64
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -283,6 +296,7 @@ PAYLOAD_KEYS = {
         "goal",
         "team_policy",
         "executor_policy",
+        STRICT_EXECUTION_KEY,
     },
     "proposal_recorded": {"role", "provenance", "submission", "retry_id"},
     "cross_examination_recorded": {
@@ -343,6 +357,33 @@ CANDIDATE_KEYS = {
     "objection_dispositions",
     "remaining_risks",
 }
+CANDIDATE_OPTIONAL_KEYS = {"execution_constraints"}
+
+# Optional D1 provenance fields. Old ledgers omit them entirely and replay
+# against exactly the original schema.
+PROPOSAL_OPTIONAL_KEYS = {"source_evidence"}
+CROSS_OPTIONAL_KEYS = {"source_evidence"}
+BALLOT_OPTIONAL_KEYS = {"source_evidence"}
+ENROLLMENT_OPTIONAL_KEYS = {STRICT_EXECUTION_KEY}
+NEW_CYCLE_AUTHORIZATION_OPTIONAL_KEYS = {"authorization_kind"}
+SOURCE_EVIDENCE_KEYS = {
+    "provider",
+    "operation",
+    "job_id",
+    "evidence_digest",
+    "evidence_event_id",
+    "task_source_sha256",
+    "job_meta_sha256",
+    "job_result_sha256",
+    "provider_result_sha256",
+    "provider_payload_sha256",
+    "original_payload_sha256",
+    "mapped_sha256",
+    "observed_workspace_digest",
+    "assignment_digest",
+    "candidate_sha256",
+}
+AUTHORIZATION_KINDS = ("human", "coordinator")
 
 _HOOKS: dict[str, Any] = {}
 
@@ -516,12 +557,226 @@ def _validate_brief(raw: Any, label: str) -> dict[str, Any]:
     }
 
 
+def _plan_is_strict(static: dict[str, Any] | None) -> bool:
+    """Return whether an enrollment explicitly opted into strict execution."""
+    if not isinstance(static, dict):
+        return False
+    return static.get(STRICT_EXECUTION_KEY) is True
+
+
+def _constraint_pattern(value: Any, label: str) -> str:
+    """Validate one repository-relative candidate execution pattern.
+
+    Patterns are exact glob expressions approved by consensus. They are never
+    resolved as single paths here; contract narrowing compares pattern sets so
+    one approved glob cannot be treated as though it named one concrete file.
+    """
+    if not isinstance(value, str) or not value:
+        _fail(f"{label} must be a non-empty repository-relative pattern")
+    if len(value.encode("utf-8")) > MAX_PATTERN_BYTES:
+        _fail(f"{label} exceeds {MAX_PATTERN_BYTES} bytes")
+    if "\x00" in value or value.startswith("/"):
+        _fail(f"{label} must be repository-relative without NUL bytes")
+    parts = Path(value).parts
+    if any(part == ".." for part in parts):
+        _fail(f"{label} must not escape the repository")
+    if parts and parts[0] == ".git":
+        _fail(f"{label} must not target Git metadata")
+    return value
+
+
+def _constraint_pattern_list(value: Any, label: str, minimum: int) -> list[str]:
+    if not isinstance(value, list):
+        _fail(f"{label} must be a JSON array of repository-relative patterns")
+    if not minimum <= len(value) <= MAX_CONSTRAINT_PATTERNS:
+        _fail(
+            f"{label} must contain between {minimum} and "
+            f"{MAX_CONSTRAINT_PATTERNS} patterns"
+        )
+    patterns = [_constraint_pattern(item, f"{label}[{index}]") for index, item in enumerate(value)]
+    if len(set(patterns)) != len(patterns):
+        _fail(f"{label} must not repeat a pattern")
+    return patterns
+
+
+def _criterion_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _validate_execution_criteria(
+    raw: Any, manifest_step: dict[str, Any] | None
+) -> list[dict[str, str]]:
+    """Validate stable criterion IDs bound to exact manifest text digests.
+
+    Coverage is deliberately structural: it proves every approved manifest
+    criterion text has exactly one stable ID and digest. It makes no semantic
+    claim that an arbitrary English requirement is satisfied.
+    """
+    if not isinstance(raw, list):
+        _fail("execution_constraints.criteria must be a JSON array")
+    if not 1 <= len(raw) <= MAX_CONSTRAINT_CRITERIA:
+        _fail(
+            "execution_constraints.criteria must contain between 1 and "
+            f"{MAX_CONSTRAINT_CRITERIA} entries"
+        )
+    criteria: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    seen_digests: set[str] = set()
+    for index, entry in enumerate(raw):
+        label = f"execution_constraints.criteria[{index}]"
+        item = _exact_keys(entry, {"id", "text_sha256"}, label)
+        criterion_id = item.get("id")
+        if not isinstance(criterion_id, str) or not CRITERION_ID_RE.fullmatch(
+            criterion_id
+        ):
+            _fail(f"{label}.id must match {CRITERION_ID_RE.pattern}")
+        digest = item.get("text_sha256")
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            _fail(f"{label}.text_sha256 must be a lowercase SHA-256 digest")
+        if criterion_id in seen_ids:
+            _fail(f"{label}.id {criterion_id!r} is repeated")
+        if digest in seen_digests:
+            _fail(f"{label}.text_sha256 {digest!r} is repeated")
+        seen_ids.add(criterion_id)
+        seen_digests.add(digest)
+        criteria.append({"id": criterion_id, "text_sha256": digest})
+    if manifest_step is not None:
+        expected = sorted(
+            _criterion_digest(item) for item in manifest_step["acceptance_criteria"]
+        )
+        actual = sorted(item["text_sha256"] for item in criteria)
+        if actual != expected:
+            _fail(
+                "execution_constraints.criteria must bind exactly the manifest "
+                "acceptance criteria text digests for this step"
+            )
+    return criteria
+
+
+def _validate_validation_command(raw: Any, label: str) -> dict[str, Any]:
+    item = _keys_with_optional(raw, {"argv"}, {"label"}, label)
+    argv = item.get("argv")
+    if not isinstance(argv, list) or not argv:
+        _fail(f"{label}.argv must be a non-empty literal argument array")
+    if len(argv) > MAX_VALIDATION_ARGV:
+        _fail(f"{label}.argv has too many arguments")
+    normalized: list[str] = []
+    for index, argument in enumerate(argv):
+        if not isinstance(argument, str) or not argument:
+            _fail(f"{label}.argv[{index}] must be a non-empty string")
+        if len(argument.encode("utf-8")) > MAX_VALIDATION_ARG_BYTES:
+            _fail(f"{label}.argv[{index}] exceeds {MAX_VALIDATION_ARG_BYTES} bytes")
+        if "\x00" in argument or "\n" in argument or "\r" in argument:
+            _fail(
+                f"{label}.argv[{index}] must be one literal argument without "
+                "NUL or line breaks"
+            )
+        normalized.append(argument)
+    result: dict[str, Any] = {"argv": normalized}
+    description = item.get("label")
+    if description is not None:
+        result["label"] = _text(description, f"{label}.label", minimum=2)
+    return result
+
+
+def _validate_validation_commands(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        _fail("execution_constraints.required_validation must be a JSON array")
+    if not 1 <= len(raw) <= MAX_VALIDATION_COMMANDS:
+        _fail(
+            "execution_constraints.required_validation must contain between 1 and "
+            f"{MAX_VALIDATION_COMMANDS} literal commands"
+        )
+    commands = [
+        _validate_validation_command(
+            entry, f"execution_constraints.required_validation[{index}]"
+        )
+        for index, entry in enumerate(raw)
+    ]
+    seen: set[tuple[str, ...]] = set()
+    for command in commands:
+        key = tuple(command["argv"])
+        if key in seen:
+            _fail("execution_constraints.required_validation repeats a command")
+        seen.add(key)
+    return commands
+
+
+def validate_execution_constraints(
+    raw: Any, manifest_step: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Validate a version 1 candidate execution-constraints object."""
+    value = _exact_keys(
+        raw,
+        {
+            "version",
+            "allowed_paths",
+            "denied_paths",
+            "criteria",
+            "required_validation",
+            "max_changed_files",
+        },
+        "execution_constraints",
+    )
+    version = value.get("version")
+    if type(version) is not int or version != EXECUTION_CONSTRAINTS_VERSION:
+        _fail("execution_constraints.version is not supported")
+    allowed = _constraint_pattern_list(
+        value.get("allowed_paths"), "execution_constraints.allowed_paths", minimum=1
+    )
+    denied = _constraint_pattern_list(
+        value.get("denied_paths"), "execution_constraints.denied_paths", minimum=0
+    )
+    criteria = _validate_execution_criteria(value.get("criteria"), manifest_step)
+    required = _validate_validation_commands(value.get("required_validation"))
+    maximum = value.get("max_changed_files")
+    if maximum is not None and (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum <= 0
+        or maximum > 100_000
+    ):
+        _fail("execution_constraints.max_changed_files must be a positive integer")
+    return {
+        "version": EXECUTION_CONSTRAINTS_VERSION,
+        "allowed_paths": allowed,
+        "denied_paths": denied,
+        "criteria": criteria,
+        "required_validation": required,
+        "max_changed_files": maximum,
+    }
+
+
 def _exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         _fail(f"{label} must be a JSON object")
     actual = set(value)
     missing = sorted(expected - actual)
     extra = sorted(actual - expected)
+    if missing:
+        _fail(f"{label} is missing fields: {', '.join(missing)}")
+    if extra:
+        _fail(f"{label} has unknown fields: {', '.join(extra)}")
+    return value
+
+
+def _keys_with_optional(
+    value: Any,
+    required: set[str],
+    optional: set[str],
+    label: str,
+) -> dict[str, Any]:
+    """Validate exact required keys plus a fixed optional allowlist.
+
+    The distinction keeps every historical event schema byte-compatible while
+    letting a new strict-mode event carry additional, explicitly enumerated
+    fields.  An unknown field is still rejected.
+    """
+    if not isinstance(value, dict):
+        _fail(f"{label} must be a JSON object")
+    actual = set(value)
+    missing = sorted(required - actual)
+    extra = sorted(actual - required - optional)
     if missing:
         _fail(f"{label} is missing fields: {', '.join(missing)}")
     if extra:
@@ -1615,6 +1870,16 @@ def plan_is_managed(plan_id: str) -> bool:
     return bool(_read_json(plan_path).get("managed"))
 
 
+def plan_is_strict_execution(plan_id: str) -> bool:
+    """Read-only check of an enrolled plan's strict-execution mode.
+
+    Used only to give strict plans a fail-closed CLI diagnostic before the
+    generic provenance shape is validated. It grants no authority.
+    """
+    state = replay_events(_plan_path(plan_id))
+    return _plan_is_strict(state.get("static"))
+
+
 def _enrollment_failure_message(
     identity: dict[str, Any], entry: dict[str, Any] | None, managed: str | None
 ) -> str | None:
@@ -1635,7 +1900,9 @@ def _enrollment_failure_message(
 
 @contextlib.contextmanager
 def launch_admission(
-    workspace: Path, plan_id: str | None = None
+    workspace: Path,
+    plan_id: str | None = None,
+    managed: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Serialize launch admission against enrollment, then yield the identity.
 
@@ -1644,7 +1911,16 @@ def launch_admission(
     home is still visible. The caller must create the job directory and a
     ``state=starting`` meta record before leaving this context so that a
     concurrent enrollment sees an active job and refuses to enroll.
+
+    ``managed`` is an internal D1 descriptor from the execution helper. It is
+    never a user CLI flag. A managed checkout admits exactly the pre-registered
+    discussion or implementation job named by that descriptor; every other
+    launch, including role/config/allow-dirty/concurrent overrides, remains
+    blocked. The validator runs under the plan lock owned by the execution
+    helper and re-checks the current B1 binding.
     """
+    if managed is not None and not isinstance(managed, dict):
+        _fail("Managed launch admission requires a protected execution descriptor")
     identity = _canonical(workspace)
     if not identity.get("is_git"):
         # A managed item cannot be accepted through a non-Git workspace either.
@@ -1653,6 +1929,8 @@ def launch_admission(
                 f"Plan {plan_id} is a managed B1 research plan; no managed writer may "
                 "start before the B2 implementation gate"
             )
+        if managed is not None:
+            _fail("Managed execution requires a canonical Git work tree")
         yield identity
         return
     with _admission_locks(identity):
@@ -1663,8 +1941,38 @@ def launch_admission(
                 f"for plan {intent['plan_id']}; B1 fails closed until it is recovered"
             )
         entry = _workspace_entries(identity)
-        managed = _managed_plan_for_identity(identity["root"])
-        message = _enrollment_failure_message(identity, entry, managed)
+        managed_plan = _managed_plan_for_identity(identity["root"])
+        if managed is not None:
+            if not identity.get("is_work_tree"):
+                _fail("Managed execution requires a canonical Git work tree")
+            requested_plan = managed.get("plan_id")
+            if plan_id is not None and plan_id != requested_plan:
+                _fail("Managed launch plan does not match the requested plan")
+            if entry is not None and entry.get("plan_id") != requested_plan:
+                _fail(
+                    "Managed launch plan does not match this workspace enrollment"
+                )
+            if managed_plan is not None and managed_plan != requested_plan:
+                _fail("Managed launch plan does not own this workspace")
+            if entry is None and managed_plan is None:
+                _fail(
+                    f"Plan {requested_plan} is not the managed enrollment for "
+                    f"{identity['root']}"
+                )
+            validator = _HOOKS.get("managed_launch_validator")
+            if validator is None:
+                _fail(
+                    "Managed execution admission is unavailable; failing closed"
+                )
+            try:
+                validator(managed, identity)
+            except _hook("runner_error"):
+                raise
+            except Exception as exc:
+                _fail(f"Managed execution admission failed: {exc}")
+            yield identity
+            return
+        message = _enrollment_failure_message(identity, entry, managed_plan)
         if message:
             _fail(message)
         if plan_id:
@@ -1697,6 +2005,16 @@ def worker_block_reason(meta: dict[str, Any]) -> str | None:
     """
     runner_error = _hook("runner_error")
     try:
+        if "managed_execution" in meta:
+            managed = meta.get("managed_execution")
+            if not isinstance(managed, dict):
+                return "Managed execution metadata is malformed; failing closed"
+            validator = _HOOKS.get("managed_worker_validator")
+            if validator is None:
+                return (
+                    "Managed execution worker validation is unavailable; failing closed"
+                )
+            return validator(meta)
         plan_id = meta.get("plan_id") or meta.get("managed_plan_id")
         if plan_id:
             if meta.get("managed_plan_id") or plan_is_managed(str(plan_id)):
@@ -1938,6 +2256,285 @@ def _provenance(raw: Any, label: str) -> dict[str, Any]:
     return {"job_id": job_id, "leader": leader}
 
 
+def _validate_source_evidence(raw: Any, label: str) -> dict[str, Any]:
+    """Validate the immutable provenance record copied from D1 ingestion.
+
+    The original provider payload and result remain in D1's content-addressed
+    evidence store; B1 records only fixed hashes and identities so replay can
+    validate this ledger without reading another log or probing a process.
+    """
+    value = _exact_keys(raw, SOURCE_EVIDENCE_KEYS, label)
+    provider = value.get("provider")
+    if provider not in {"deepseek", "glm"}:
+        _fail(f"{label}.provider is not a reserved readonly provider")
+    if value.get("operation") not in {"proposal", "cross_examination", "consensus"}:
+        _fail(f"{label}.operation is not a readonly discussion operation")
+    job_id = value.get("job_id")
+    if not isinstance(job_id, str) or not ID_RE.fullmatch(job_id):
+        _fail(f"{label}.job_id must be a valid job identifier")
+    evidence_event_id = value.get("evidence_event_id")
+    if not isinstance(evidence_event_id, str) or not OP_ID_RE.fullmatch(
+        evidence_event_id.split(":", 1)[0]
+    ):
+        _fail(f"{label}.evidence_event_id is invalid")
+    for key in (
+        "evidence_digest",
+        "task_source_sha256",
+        "job_meta_sha256",
+        "job_result_sha256",
+        "provider_result_sha256",
+        "provider_payload_sha256",
+        "original_payload_sha256",
+        "mapped_sha256",
+        "observed_workspace_digest",
+        "assignment_digest",
+    ):
+        item = value.get(key)
+        if not isinstance(item, str) or not DIGEST_RE.fullmatch(item):
+            _fail(f"{label}.{key} must be a lowercase SHA-256 digest")
+    candidate = value.get("candidate_sha256")
+    if candidate is not None and (
+        not isinstance(candidate, str) or not DIGEST_RE.fullmatch(candidate)
+    ):
+        _fail(f"{label}.candidate_sha256 must be a digest or null")
+    return dict(value)
+
+
+def _strict_participant_evidence(
+    static: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    label: str,
+    operation: str,
+    candidate_sha256: str | None,
+) -> None:
+    """Replay the strict participant gate from immutable ledger fields.
+
+    Codex is the trusted active coordinator and must carry a leader identity
+    with no provider job. Every other role must carry the immutable D1 source
+    evidence for the exact operation, role, slot and (for ballots) candidate.
+    This is structural replay validation; semantic review remains D2.
+    """
+    if not _plan_is_strict(static):
+        return
+    role = payload.get("role")
+    if role == "codex":
+        if "source_evidence" in payload:
+            _fail(f"{label}.source_evidence is not valid for the Codex leader")
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, dict):
+            _fail(f"{label}.provenance is missing")
+        if provenance.get("job_id") is not None or not provenance.get("leader"):
+            _fail(
+                "Strict-execution Codex content requires the active leader "
+                "identity and never a provider job identity"
+            )
+        return
+    source = payload.get("source_evidence")
+    if not isinstance(source, dict):
+        _fail(
+            f"{label} has no protected provider source evidence; role labels and "
+            "job strings never grant discussion authority"
+        )
+    evidence = _validate_source_evidence(source, f"{label}.source_evidence")
+    if evidence.get("provider") != role:
+        _fail(f"{label} provider does not match its role slot")
+    if evidence.get("operation") != operation:
+        _fail(f"{label} operation does not match its discussion round")
+    if evidence.get("candidate_sha256") != candidate_sha256:
+        _fail(f"{label} does not bind the current frozen candidate digest")
+
+
+def _provider_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _fail(f"{label} must be a non-empty string")
+    if len(value.encode("utf-8")) > MAX_TEXT_BYTES:
+        _fail(f"{label} exceeds {MAX_TEXT_BYTES} bytes")
+    if "\x00" in value:
+        _fail(f"{label} contains a NUL byte")
+    return value
+
+
+def _provider_text_list(
+    value: Any, label: str, *, allow_empty: bool = False
+) -> list[str]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        _fail(f"{label} must be a non-empty JSON array of strings")
+    if len(value) > 100:
+        _fail(f"{label} has too many entries")
+    return [
+        _provider_text(item, f"{label}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
+def _provider_exact_keys(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    return _exact_keys(value, keys, label)
+
+
+def map_provider_payload(operation: str, payload: Any) -> dict[str, Any]:
+    """Deterministically map one validated C payload to the B1 schema.
+
+    The mapping is versioned by C's result_version/operation and preserves both
+    original and mapped content: callers keep the original payload in the D1
+    evidence blob and B1 records both hashes. No field is synthesized; a valid
+    but insufficient provider response fails here and must be recorded as an
+    invalid submission, never as agreement.
+    """
+    if operation == "proposal":
+        value = _provider_exact_keys(
+            payload,
+            {
+                "approach",
+                "rationale",
+                "assumptions",
+                "problems",
+                "alternatives",
+                "feasibility",
+                "testing",
+            },
+            "provider proposal payload",
+        )
+        return {
+            "approach": _provider_text(value["approach"], "proposal.approach"),
+            "rationale": _provider_text(value["rationale"], "proposal.rationale"),
+            "assumptions": _provider_text_list(
+                value["assumptions"], "proposal.assumptions"
+            ),
+            "risks": _provider_text_list(value["problems"], "proposal.problems"),
+            "alternatives": _provider_text_list(
+                value["alternatives"], "proposal.alternatives"
+            ),
+            "feasibility": _provider_text(
+                value["feasibility"], "proposal.feasibility"
+            ),
+            "tests": _provider_text_list(value["testing"], "proposal.testing"),
+        }
+    if operation == "cross_examination":
+        value = _provider_exact_keys(
+            payload,
+            {"objections", "responses", "revisions"},
+            "provider cross-examination payload",
+        )
+        objections = value["objections"]
+        if not isinstance(objections, list):
+            _fail("cross-examination.objections must be a JSON array")
+        if len(objections) > 100:
+            _fail("cross-examination.objections has too many entries")
+        challenges: list[dict[str, str]] = []
+        for index, item in enumerate(objections):
+            label = f"cross-examination.objections[{index}]"
+            if isinstance(item, str):
+                challenges.append(
+                    {"objection": _provider_text(item, label)}
+                )
+                continue
+            entry = _keys_with_optional(
+                item, {"objection"}, {"severity"}, label
+            )
+            challenge = {
+                "objection": _provider_text(entry["objection"], f"{label}.objection")
+            }
+            severity = entry.get("severity")
+            if severity is not None:
+                if severity not in {"low", "medium", "high"}:
+                    _fail(f"{label}.severity must be low, medium, or high")
+                challenge["severity"] = severity
+            challenges.append(challenge)
+        return {
+            "responses": _provider_text_list(
+                value["responses"], "cross-examination.responses"
+            ),
+            "challenges": challenges,
+            "revisions": _provider_text_list(
+                value["revisions"], "cross-examination.revisions"
+            ),
+        }
+    if operation == "consensus":
+        value = _provider_exact_keys(
+            payload,
+            {"decision", "candidate_sha256", "rationale"},
+            "provider consensus payload",
+        )
+        decision = value["decision"]
+        if decision not in VOTES:
+            _fail("consensus.decision must be AGREE, DISAGREE, or NEEDS_DISCUSSION")
+        digest = value["candidate_sha256"]
+        if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            _fail("consensus.candidate_sha256 must be a lowercase SHA-256 digest")
+        return {
+            "vote": decision,
+            "digest": digest,
+            "rationale": _provider_text(
+                value["rationale"], "consensus.rationale"
+            ),
+        }
+    _fail(f"Provider mapping is unsupported for operation {operation!r}")
+
+
+def _normalize_cross_without_ids(raw: Any) -> dict[str, Any]:
+    """Normalize a mapped cross-examination without assigning objection IDs."""
+    value = _exact_keys(raw, CROSS_KEYS, "cross-examination")
+    responses = _text_list(
+        value.get("responses"), "cross-examination.responses", minimum_chars=10
+    )
+    challenges = value.get("challenges")
+    if not isinstance(challenges, list) or len(challenges) > MAX_LIST_ITEMS:
+        _fail(
+            f"cross-examination.challenges must contain at most {MAX_LIST_ITEMS} items"
+        )
+    normalized_challenges: list[dict[str, str]] = []
+    for index, challenge in enumerate(challenges):
+        label = f"cross-examination.challenges[{index}]"
+        item = _keys_with_optional(challenge, {"objection"}, {"severity"}, label)
+        normalized = {
+            "objection": _text(item.get("objection"), f"{label}.objection", minimum=10)
+        }
+        severity = item.get("severity")
+        if severity is not None:
+            normalized["severity"] = _text(severity, f"{label}.severity", minimum=2)
+        normalized_challenges.append(normalized)
+    revisions = _text_list(
+        value.get("revisions"),
+        "cross-examination.revisions",
+        minimum_items=0,
+        minimum_chars=3,
+    )
+    return {
+        "responses": responses,
+        "challenges": normalized_challenges,
+        "revisions": revisions,
+    }
+
+
+def normalize_provider_mapping(operation: str, payload: Any) -> dict[str, Any]:
+    """Map and normalize one provider payload exactly as B1 will record it."""
+    mapped = map_provider_payload(operation, payload)
+    if operation == "proposal":
+        return _validate_proposal(mapped)
+    if operation == "cross_examination":
+        return _normalize_cross_without_ids(mapped)
+    if operation == "consensus":
+        rationale = _text(mapped["rationale"], "ballot.rationale", minimum=1)
+        return {
+            "vote": mapped["vote"],
+            "digest": mapped["digest"],
+            "rationale": rationale,
+        }
+    _fail(f"Provider normalization is unsupported for operation {operation!r}")
+
+
+def provider_operation_for_round(round_number: int) -> str:
+    """Return the reserved C operation bound to a discussion round."""
+    if round_number == 1:
+        return "proposal"
+    if round_number == 2:
+        return "cross_examination"
+    if round_number == 3:
+        return "consensus"
+    _fail(f"Discussion round {round_number!r} has no provider operation")
+
+
 def _validate_proposal(raw: Any) -> dict[str, Any]:
     value = _exact_keys(raw, PROPOSAL_KEYS, "proposal")
     return {
@@ -2028,9 +2625,18 @@ def _validate_cross(
 
 
 def _validate_candidate(
-    raw: Any, objection_ids: list[str]
+    raw: Any,
+    objection_ids: list[str],
+    manifest_step: dict[str, Any] | None = None,
+    *,
+    strict: bool = False,
 ) -> dict[str, Any]:
-    value = _exact_keys(raw, CANDIDATE_KEYS, "candidate")
+    value = _keys_with_optional(
+        raw,
+        CANDIDATE_KEYS - CANDIDATE_OPTIONAL_KEYS,
+        CANDIDATE_OPTIONAL_KEYS,
+        "candidate",
+    )
     candidate = {
         "final_design": _text(value.get("final_design"), "candidate.final_design", minimum=40),
         "important_decisions": _text_list(
@@ -2107,11 +2713,32 @@ def _validate_candidate(
             "candidate.objection_dispositions must dispose every numbered objection; "
             f"missing: {', '.join(missing)}"
         )
+    if "execution_constraints" in value:
+        if not strict:
+            _fail(
+                "execution_constraints are valid only for strict-execution "
+                "candidates; legacy plans never acquire source-write authority"
+            )
+        candidate["execution_constraints"] = validate_execution_constraints(
+            value.get("execution_constraints"), manifest_step
+        )
+    elif strict:
+        _fail(
+            "Strict-execution candidates must include version 1 execution_constraints"
+        )
     return candidate
 
 
 def _validate_enrollment_payload(payload: dict[str, Any], plan_id: str) -> dict[str, Any]:
-    _exact_keys(payload, PAYLOAD_KEYS["plan_enrolled"], "plan_enrolled payload")
+    _keys_with_optional(
+        payload,
+        PAYLOAD_KEYS["plan_enrolled"] - ENROLLMENT_OPTIONAL_KEYS,
+        ENROLLMENT_OPTIONAL_KEYS,
+        "plan_enrolled payload",
+    )
+    strict_execution = payload.get(STRICT_EXECUTION_KEY)
+    if strict_execution is not None and strict_execution is not True:
+        _fail("plan_enrolled strict_execution must be true when present")
     manifest, manifest_digest = validate_manifest(payload.get("manifest"))
     if payload.get("manifest_digest") != manifest_digest:
         _fail("plan_enrolled manifest_digest does not match the manifest content")
@@ -2304,13 +2931,27 @@ def _apply_step_event(
         previous_digest = (state.get("candidate") or {}).get("digest")
         if payload.get("previous_digest") != previous_digest:
             _fail("new cycle does not preserve the previous frozen digest")
-        authorization = _exact_keys(
+        authorization = _keys_with_optional(
             payload.get("authorization"),
             {"authorized_by", "text"},
+            NEW_CYCLE_AUTHORIZATION_OPTIONAL_KEYS,
             "new_cycle_authorized.authorization",
         )
         _text(authorization.get("authorized_by"), "authorization.authorized_by", minimum=2)
         _text(authorization.get("text"), "authorization.text", minimum=10)
+        if _plan_is_strict(static):
+            kind = authorization.get("authorization_kind")
+            if kind not in AUTHORIZATION_KINDS:
+                _fail(
+                    "Strict-execution new cycles require authorization_kind "
+                    "'human' or 'coordinator'"
+                )
+            if previous_outcome == STAGE_HUMAN and kind != "human":
+                _fail(
+                    "A non-unanimous cycle can only reopen through an honest human "
+                    "authorization; coordinator-requested consensus is available "
+                    "only after a successful unanimous cycle"
+                )
         state["cycle"] = cycle
         state["proposals"] = {}
         state["cross_examinations"] = {}
@@ -2329,6 +2970,10 @@ def _apply_step_event(
             "previous_digest": previous_digest,
             "opened_at": event["at"],
         }
+        if "authorization_kind" in authorization:
+            state["cycle_opening"]["authorization_kind"] = authorization[
+                "authorization_kind"
+            ]
         return
     if event["step_id"] != state["step_id"]:
         _fail("Ledger event is attached to the wrong step")
@@ -2343,7 +2988,23 @@ def _apply_step_event(
             _fail("Proposal recorded outside an open round 1")
         if event.get("round") != 1:
             _fail("Proposal event must be round 1")
-        _exact_keys(payload, PAYLOAD_KEYS["proposal_recorded"], "proposal_recorded payload")
+        _keys_with_optional(
+            payload,
+            PAYLOAD_KEYS["proposal_recorded"],
+            PROPOSAL_OPTIONAL_KEYS,
+            "proposal_recorded payload",
+        )
+        if "source_evidence" in payload:
+            _validate_source_evidence(
+                payload.get("source_evidence"), "proposal_recorded.source_evidence"
+            )
+        _strict_participant_evidence(
+            static,
+            payload,
+            label="proposal_recorded",
+            operation="proposal",
+            candidate_sha256=None,
+        )
         role = _event_role(state, payload, "Proposal")
         if role in state["proposals"]:
             _fail(f"Duplicate proposal from {role} in cycle {cycle}")
@@ -2368,10 +3029,23 @@ def _apply_step_event(
             _fail("Cross-examination recorded outside an open round 2")
         if event.get("round") != 2:
             _fail("Cross-examination event must be round 2")
-        _exact_keys(
+        _keys_with_optional(
             payload,
             PAYLOAD_KEYS["cross_examination_recorded"],
+            CROSS_OPTIONAL_KEYS,
             "cross_examination_recorded payload",
+        )
+        if "source_evidence" in payload:
+            _validate_source_evidence(
+                payload.get("source_evidence"),
+                "cross_examination_recorded.source_evidence",
+            )
+        _strict_participant_evidence(
+            static,
+            payload,
+            label="cross_examination_recorded",
+            operation="cross_examination",
+            candidate_sha256=None,
         )
         role = _event_role(state, payload, "Cross-examination")
         if role in state["cross_examinations"]:
@@ -2408,11 +3082,15 @@ def _apply_step_event(
         objection_ids = [item["objection_id"] for item in state["objections"]]
         if payload.get("objection_ids") != objection_ids:
             _fail("Candidate objection references do not match this cycle's objections")
-        candidate = _validate_candidate(payload.get("candidate"), objection_ids)
-        binding = payload.get("binding")
-        expected_binding = _binding_for(
-            static, _manifest_step(static, state["step_id"]), cycle
+        manifest_step = _manifest_step(static, state["step_id"])
+        candidate = _validate_candidate(
+            payload.get("candidate"),
+            objection_ids,
+            manifest_step,
+            strict=_plan_is_strict(static),
         )
+        binding = payload.get("binding")
+        expected_binding = _binding_for(static, manifest_step, cycle)
         if not isinstance(binding, dict) or binding != expected_binding:
             _fail("Candidate binding does not match the plan, step, dependencies, policy, cycle, and vote round")
         digest = payload.get("digest")
@@ -2435,8 +3113,24 @@ def _apply_step_event(
             _fail("Ballot recorded before the candidate was frozen")
         if event.get("round") != 3:
             _fail("Ballot event must be round 3")
-        _exact_keys(payload, PAYLOAD_KEYS["ballot_recorded"], "ballot_recorded payload")
+        _keys_with_optional(
+            payload,
+            PAYLOAD_KEYS["ballot_recorded"],
+            BALLOT_OPTIONAL_KEYS,
+            "ballot_recorded payload",
+        )
+        if "source_evidence" in payload:
+            _validate_source_evidence(
+                payload.get("source_evidence"), "ballot_recorded.source_evidence"
+            )
         role = _event_role(state, payload, "Ballot")
+        _strict_participant_evidence(
+            static,
+            payload,
+            label="ballot_recorded",
+            operation="consensus",
+            candidate_sha256=state["candidate"]["digest"],
+        )
         if role in state["ballots"]:
             _fail(f"Duplicate ballot from {role} in cycle {cycle}")
         if payload.get("vote") not in VOTES:
@@ -2610,6 +3304,44 @@ def _plan_lock(path: Path) -> Iterator[None]:
     consensus.mkdir(parents=True, exist_ok=True, mode=0o700)
     with _hook("record_lock")(consensus / "ledger"):
         yield
+
+
+@contextlib.contextmanager
+def plan_lock(plan_id: str) -> Iterator[None]:
+    """Hold the one existing B1 plan lock for a composite D1 transition.
+
+    D1 uses this exact lock for every relationship check and journal append so
+    a B1 cycle change and an execution admission can never interleave. Callers
+    must not call another B1 command that re-acquires the same lock while it is
+    held; the ``*_locked`` helpers below are the lock-holding surface.
+    """
+    path = _plan_path(plan_id)
+    with _plan_lock(path):
+        yield
+
+
+def replay_plan_state_locked(
+    plan_id: str, *, repair: bool = True
+) -> dict[str, Any]:
+    """Replay a mutable managed plan while the caller holds ``plan_lock``."""
+    path = _plan_path(plan_id)
+    state = replay_events(path)
+    _reject_historical_state(state)
+    if repair:
+        state = _repair_outcome_locked(path, state)
+    return state
+
+
+def replay_plan_state_unlocked(
+    plan_id: str, *, repair: bool = False
+) -> dict[str, Any]:
+    """Read-only replay for view overlays that already hold the plan lock."""
+    path = _plan_path(plan_id)
+    state = replay_events(path)
+    _reject_historical_state(state)
+    if repair:
+        state = _repair_outcome_locked(path, state)
+    return state
 
 
 def _operation_events(
@@ -2897,6 +3629,35 @@ def _step_summary(step: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _execution_overlay(
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the derived D1 execution view for a strict plan.
+
+    The overlay is an existing B1 view extension, not a second source of truth:
+    it is recomputed from the execution-fact journal, and a missing, corrupt or
+    unsupported journal fails the whole view closed.
+    """
+    static = state["static"]
+    if not _plan_is_strict(static):
+        return None
+    hook = _HOOKS.get("execution_overlay")
+    if hook is None:
+        _fail(
+            "Strict-execution plan has no execution journal reader; failing closed"
+        )
+    error_type = _hook("runner_error")
+    try:
+        overlay = hook(plan_id=static["plan_id"], state=state)
+    except error_type:
+        raise
+    except Exception as exc:
+        _fail(f"Strict-execution execution journal is unavailable: {exc}")
+    if not isinstance(overlay, dict):
+        _fail("Strict-execution execution journal returned an invalid overlay")
+    return overlay
+
+
 def _build_projection(state: dict[str, Any]) -> dict[str, Any]:
     static = state["static"]
     if static is None:
@@ -2928,7 +3689,21 @@ def _build_projection(state: dict[str, Any]) -> dict[str, Any]:
     goal = dict(static["goal"])
     historical = _historical_state(state)
     goal["status"] = "historical_read_only" if historical else "active"
-    return {
+    overlay = _execution_overlay(state)
+    if overlay is not None:
+        step_views = overlay.get("steps") if isinstance(overlay.get("steps"), dict) else {}
+        for item in items:
+            view = step_views.get(item["id"]) if isinstance(step_views, dict) else None
+            if isinstance(view, dict):
+                item["execution_stage"] = view.get("stage")
+                item["execution_next_action"] = view.get("next_action")
+                item["execution_source_drift"] = bool(
+                    view.get("source_drift")
+                )
+                item["execution_blocked_reasons"] = list(
+                    view.get("blocked_reasons") or []
+                )
+    result = {
         "plan_id": static["plan_id"],
         "title": static["title"],
         "workspace": static["workspace"],
@@ -2954,6 +3729,22 @@ def _build_projection(state: dict[str, Any]) -> dict[str, Any]:
         "counts": counts,
         "complete": False,
     }
+    if overlay is not None:
+        result["strict_execution"] = True
+        result["execution"] = {
+            key: overlay.get(key)
+            for key in (
+                "stage",
+                "next_action",
+                "blocked_reasons",
+                "attempt",
+                "source_drift",
+                "implementation_gate",
+                "closed_gates",
+            )
+            if key in overlay
+        }
+    return result
 
 
 def _build_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
@@ -3021,7 +3812,50 @@ def _build_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
     for summary in steps:
         summary["artifacts"] = step_artifacts.get(summary["id"])
     projection = _build_projection(state)
-    return {
+    overlay = _execution_overlay(state)
+    implementation_gate = "B1_FAIL_CLOSED_AWAITING_B2"
+    if overlay is not None:
+        step_views = (
+            overlay.get("steps") if isinstance(overlay.get("steps"), dict) else {}
+        )
+        for summary in steps:
+            view = step_views.get(summary["id"])
+            if not isinstance(view, dict):
+                continue
+            summary["execution_stage"] = view.get("stage")
+            summary["execution_next_action"] = view.get("next_action")
+            summary["execution_source_drift"] = bool(view.get("source_drift"))
+            summary["execution_missing_actions"] = list(
+                view.get("missing_actions") or []
+            )
+            summary["execution_blocked_reasons"] = list(
+                view.get("blocked_reasons") or []
+            )
+            summary["execution_attempt"] = view.get("attempt")
+            summary["formal_repair_budget"] = view.get("formal_repair_budget")
+            if summary["consensus_state"] == STAGE_CONSENSUS:
+                # The strict-execution continuation surface replaces the
+                # historical "B1 starts no writer" text; the overlay is derived
+                # from the execution journal and never marks the item done.
+                summary["missing_actions"] = list(
+                    view.get("missing_actions") or []
+                )
+                if view.get("next_action"):
+                    summary["next_action"] = view["next_action"]
+                summary["blocked_reasons"] = list(
+                    view.get("blocked_reasons") or []
+                )
+        aggregate_missing = [
+            f"{summary['id']}: {action}"
+            for summary in steps
+            for action in summary["missing_actions"]
+        ]
+        if reached and overlay.get("next_action"):
+            next_action = str(overlay["next_action"])
+        implementation_gate = str(
+            overlay.get("implementation_gate") or "D1_MANAGED_EXECUTION"
+        )
+    result = {
         "plan_id": static["plan_id"],
         "title": static["title"],
         "workspace": static["workspace"],
@@ -3042,7 +3876,7 @@ def _build_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
         "complete": False,
         "counts": projection["counts"],
         "consensus_state": consensus_state,
-        "implementation_gate": "B1_FAIL_CLOSED_AWAITING_B2",
+        "implementation_gate": implementation_gate,
         "next_item": next_item,
         "next_action": next_action,
         "steps": steps,
@@ -3061,12 +3895,44 @@ def _build_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
             )
             if historical
             else (
-                "Resume from this replayed ledger checkpoint; record only the listed "
-                "missing actions through the public consensus commands. B1 starts no "
-                "managed writer."
+                (
+                    "Resume from this replayed ledger checkpoint; record only the "
+                    "listed missing actions through the public consensus and D1 "
+                    "execution commands. D1 stops at IMPLEMENTATION_COMPLETE; review, "
+                    "repair, PR/CI/MERGED completion and dependency opening are closed."
+                )
+                if overlay is not None
+                else (
+                    "Resume from this replayed ledger checkpoint; record only the "
+                    "listed missing actions through the public consensus commands. B1 "
+                    "starts no managed writer."
+                )
             )
         ),
     }
+    if overlay is not None:
+        result["strict_execution"] = True
+        result["execution"] = {
+            key: overlay.get(key)
+            for key in (
+                "stage",
+                "next_action",
+                "blocked_reasons",
+                "attempt",
+                "source_drift",
+                "closed_gates",
+                "formal_repair_budget",
+            )
+            if key in overlay
+        }
+        result["closed_gates"] = overlay.get("closed_gates") or {
+            "review_acceptance": "CLOSED_UNTIL_D2",
+            "formal_repair": "CLOSED_UNTIL_D2",
+            "independent_validation": "CLOSED_UNTIL_D2",
+            "pr_ci_merged": "CLOSED_UNTIL_E",
+            "dependency_opening": "CLOSED_UNTIL_E",
+        }
+    return result
 
 
 def _step_artifact_paths(
@@ -3522,6 +4388,59 @@ def _ballot_lines(
     return lines
 
 
+def _execution_constraints_lines(
+    document: dict[str, Any],
+) -> list[str]:
+    """Render approved version 1 execution constraints, when present.
+
+    Historical candidates omit the field and therefore render exactly their
+    original bytes.
+    """
+    constraints = document.get("execution_constraints")
+    if constraints is None:
+        return []
+    if not isinstance(constraints, dict):
+        return ["- (invalid execution constraints)"]
+    lines = [
+        "### Execution constraints (version 1)",
+        "",
+        "Allowed repository-relative patterns (exact approved globs):",
+        "",
+        _md_list(list(constraints.get("allowed_paths") or [])),
+        "",
+        "Denied repository-relative patterns:",
+        "",
+        _md_list(list(constraints.get("denied_paths") or [])),
+        "",
+        "Stable acceptance criteria IDs and text digests:",
+        "",
+        _md_list(
+            [
+                f"`{item['id']}` — `{item['text_sha256']}`"
+                for item in constraints.get("criteria") or []
+            ]
+        ),
+        "",
+        "Required literal validation argv:",
+        "",
+        _md_list(
+            [
+                "`" + json.dumps(item.get("argv"), ensure_ascii=False) + "`"
+                for item in constraints.get("required_validation") or []
+            ]
+        ),
+        "",
+        "Maximum changed files: "
+        + (
+            str(constraints.get("max_changed_files"))
+            if constraints.get("max_changed_files") is not None
+            else "(none declared)"
+        ),
+        "",
+    ]
+    return lines
+
+
 def _render_step_consensus(
     static: dict[str, Any],
     step: dict[str, Any],
@@ -3579,6 +4498,7 @@ def _render_step_consensus(
                 "",
                 _md_list(document.get("important_decisions", [])),
                 "",
+                *_execution_constraints_lines(document),
                 "### Rejected alternatives and reasons",
                 "",
                 _md_list(
@@ -3633,9 +4553,23 @@ def _render_step_consensus(
                 "",
                 f"All {len(roles)} roles explicitly AGREE against the frozen digest.",
                 "",
-                "B1 reports CONSENSUS_REACHED and starts no managed writer. Verified",
-                "MERGED dependency evidence and the B2 implementation lease are still",
-                "required before implementation.",
+                *(
+                    [
+                        "This strict-execution plan may now freeze the separately "
+                        "bound implementation contract and admit one reserved "
+                        "deepseek writer through D1. Review acceptance, repairs, "
+                        "PR/CI/MERGED completion and dependency opening remain "
+                        "closed.",
+                    ]
+                    if _plan_is_strict(static)
+                    else [
+                        # Historical non-strict rendering is byte-compatible:
+                        # these are the original three implementation-gate lines.
+                        "B1 reports CONSENSUS_REACHED and starts no managed writer. Verified",
+                        "MERGED dependency evidence and the B2 implementation lease are still",
+                        "required before implementation.",
+                    ]
+                ),
                 "",
             ]
         )
@@ -3750,6 +4684,7 @@ def _render_consensus(state: dict[str, Any]) -> str:
                     "",
                     _md_list(candidate["candidate"]["important_decisions"]),
                     "",
+                    *_execution_constraints_lines(candidate["candidate"]),
                     "## Rejected alternatives and reasons",
                     "",
                     _md_list(
@@ -3779,9 +4714,23 @@ def _render_consensus(state: dict[str, Any]) -> str:
                     "",
                     "## Implementation gate",
                     "",
-                    "B1 reports CONSENSUS_REACHED and starts no managed writer. Verified",
-                    "MERGED dependency evidence and the B2 implementation lease are still",
-                    "required before implementation.",
+                    *(
+                        [
+                            "Strict execution is enabled: freeze the separate "
+                            "execution contract and admit one reserved deepseek "
+                            "writer through D1. Review acceptance, repairs, "
+                            "PR/CI/MERGED completion and dependency opening remain "
+                            "closed.",
+                        ]
+                        if _plan_is_strict(static)
+                        else [
+                            # Historical non-strict rendering is byte-compatible:
+                            # these are the original three implementation-gate lines.
+                            "B1 reports CONSENSUS_REACHED and starts no managed writer. Verified",
+                            "MERGED dependency evidence and the B2 implementation lease are still",
+                            "required before implementation.",
+                        ]
+                    ),
                     "",
                 ]
             )
@@ -4116,6 +5065,7 @@ def create_managed_plan(
     executor_policy: dict[str, Any],
     manifest_raw: Any,
     policy_version: int,
+    strict_execution: bool = False,
 ) -> dict[str, Any]:
     """Validate, enroll, and create a managed research plan.
 
@@ -4134,6 +5084,8 @@ def create_managed_plan(
     """
     if not isinstance(plan_id, str) or not ID_RE.fullmatch(plan_id):
         _fail(f"Invalid plan ID: {plan_id!r}")
+    if not isinstance(strict_execution, bool):
+        _fail("strict_execution must be a boolean")
     title = _text(title, "title", minimum=2)
     if not isinstance(policy_version, int) or isinstance(policy_version, bool):
         _fail("policy-version must be an integer")
@@ -4189,23 +5141,29 @@ def create_managed_plan(
     # Timestamps are deliberately excluded so an exact retry after a lost
     # response is idempotent, while every stable user-supplied policy choice is
     # bound to the enrollment identity and conflicting retries fail closed.
-    request_digest = _request_digest(
-        "create-managed-plan",
-        plan_id=plan_id,
-        canonical_workspace=identity["root"],
-        title=title,
-        workspace_mode="project",
-        plan_sha256=plan_sha256,
-        manifest_digest=manifest_digest,
-        policy_version=policy_version,
-        goal={
+    # Legacy enrollment keeps its exact historical request digest; the strict
+    # field participates only when explicitly true.
+    enrollment_identity = {
+        "plan_id": plan_id,
+        "canonical_workspace": identity["root"],
+        "title": title,
+        "workspace_mode": "project",
+        "plan_sha256": plan_sha256,
+        "manifest_digest": manifest_digest,
+        "policy_version": policy_version,
+        "goal": {
             "objective": goal.get("objective"),
             "strategy": goal.get("strategy"),
             "risk": goal.get("risk"),
             "task_type": goal.get("task_type"),
         },
-        team_policy=_stable_enrollment_policy(team_policy),
-        executor_policy=_stable_enrollment_policy(executor_policy),
+        "team_policy": _stable_enrollment_policy(team_policy),
+        "executor_policy": _stable_enrollment_policy(executor_policy),
+    }
+    if strict_execution:
+        enrollment_identity[STRICT_EXECUTION_KEY] = True
+    request_digest = _request_digest(
+        "create-managed-plan", **enrollment_identity
     )
     # Plan IDs may be 64 characters; leave room for the operation prefix.
     operation_id = f"enroll-{plan_id[:57]}"
@@ -4258,6 +5216,7 @@ def create_managed_plan(
                     static["plan_sha256"] != plan_sha256
                     or static["manifest_digest"] != manifest_digest
                     or static["canonical_workspace"] != identity["root"]
+                    or _plan_is_strict(static) != strict_execution
                 ):
                     _fail(
                         f"Plan {plan_id} already exists with different enrollment content"
@@ -4360,6 +5319,8 @@ def create_managed_plan(
                 "team_policy": team_policy,
                 "executor_policy": executor_policy,
             }
+            if strict_execution:
+                payload[STRICT_EXECUTION_KEY] = True
             with _plan_lock(staging):
                 _append_specs(
                     staging,
@@ -4423,6 +5384,101 @@ def create_managed_plan(
     return {**views, "idempotent": False}
 
 
+def _strict_source_evidence(
+    *,
+    plan_id: str,
+    step_id: str,
+    role: str,
+    round_number: int,
+    cycle: int,
+    candidate_sha256: str | None,
+    source: Any,
+) -> dict[str, Any]:
+    """Validate one D1-ingested provider receipt for the exact strict slot.
+
+    This is the only path by which a non-Codex strict-mode submission acquires
+    its content. It returns the immutable evidence plus the original provider
+    payload; user-supplied job IDs, role strings and prompts never reach the
+    ledger without it.
+    """
+    if source is None:
+        _fail(
+            "Strict-execution submissions require --source-job evidence from a "
+            "settled reserved provider job"
+        )
+    hook = _HOOKS.get("execution_source_validator")
+    if hook is None:
+        _fail(
+            "Strict-execution provider provenance is unavailable; failing closed"
+        )
+    expected_operation = provider_operation_for_round(round_number)
+    error_type = _hook("runner_error")
+    try:
+        evidence = hook(
+            plan_id=plan_id,
+            step_id=step_id,
+            role=role,
+            round_number=round_number,
+            cycle=cycle,
+            candidate_sha256=candidate_sha256,
+            source=source,
+        )
+    except error_type:
+        raise
+    except Exception as exc:
+        _fail(f"Strict-execution provider provenance failed: {exc}")
+    required = set(SOURCE_EVIDENCE_KEYS) | {"payload"}
+    if not isinstance(evidence, dict):
+        _fail("strict-execution source evidence must be a JSON object")
+    missing = sorted(required - set(evidence))
+    if missing:
+        _fail(
+            "strict-execution source evidence is missing fields: "
+            + ", ".join(missing)
+        )
+    # The ingestion hook is trusted to return its own display fields; only the
+    # enumerated provenance/hash surface is recorded in the ledger.
+    evidence = {key: evidence[key] for key in required}
+    payload = evidence.get("payload")
+    if not isinstance(payload, dict):
+        _fail("strict-execution source evidence has no provider payload")
+    if evidence.get("provider") != role:
+        _fail(
+            "Strict-execution provider does not match the "
+            f"{ROLE_LABELS.get(role, role)} slot"
+        )
+    if evidence.get("operation") != expected_operation:
+        _fail(
+            "Strict-execution provider operation does not match the current "
+            f"discussion round ({expected_operation})"
+        )
+    _validate_source_evidence(
+        {key: evidence[key] for key in SOURCE_EVIDENCE_KEYS},
+        "strict-execution source evidence",
+    )
+    if evidence.get("candidate_sha256") != candidate_sha256:
+        _fail(
+            "Strict-execution source evidence does not bind the current frozen "
+            "candidate digest"
+        )
+    normalized = normalize_provider_mapping(expected_operation, payload)
+    if _digest(normalized) != evidence.get("mapped_sha256"):
+        _fail(
+            "Strict-execution mapped provider content does not match its recorded "
+            "mapped digest"
+        )
+    if _digest(payload) != evidence.get("original_payload_sha256"):
+        _fail(
+            "Strict-execution original provider payload does not match its "
+            "recorded original digest"
+        )
+    return evidence
+
+
+def _source_evidence_record(evidence: dict[str, Any]) -> dict[str, Any]:
+    return {key: evidence[key] for key in SOURCE_EVIDENCE_KEYS}
+
+
 def submit_consensus(
     *,
     plan_id: str,
@@ -4434,6 +5490,7 @@ def submit_consensus(
     leader: str | None,
     retry_id: str | None,
     operation_id: str | None,
+    source: Any = None,
 ) -> dict[str, Any]:
     _require_active_role(role)
     if round_number not in (1, 2):
@@ -4444,16 +5501,18 @@ def submit_consensus(
     if retry_id is not None:
         if not isinstance(retry_id, str) or not RETRY_ID_RE.fullmatch(retry_id):
             _fail(f"Invalid retry ID: {retry_id!r}")
-    request_digest = _request_digest(
-        "consensus-submit",
-        plan_id=plan_id,
-        step_id=step_id,
-        role=role,
-        round=round_number,
-        submission=submission_raw,
-        provenance=provenance,
-        retry_id=retry_id,
-    )
+    submission_fields = {
+        "plan_id": plan_id,
+        "step_id": step_id,
+        "role": role,
+        "round": round_number,
+        "submission": submission_raw,
+        "provenance": provenance,
+        "retry_id": retry_id,
+    }
+    if source is not None:
+        submission_fields["source"] = source
+    request_digest = _request_digest("consensus-submit", **submission_fields)
 
     def builder(state: dict[str, Any]) -> list[dict[str, Any]]:
         current = _require_step_state(state, step_id)
@@ -4486,6 +5545,53 @@ def submit_consensus(
                     f"Retry ID {retry_id!r} does not match the open pause "
                     f"{pause['retry_id']!r}"
                 )
+        strict = _plan_is_strict(state["static"])
+        source_evidence: dict[str, Any] | None = None
+        effective_provenance = provenance
+        if strict:
+            if role == "codex":
+                if source is not None:
+                    _fail(
+                        "Codex strict-mode submissions use the active coordinator "
+                        "leader identity, not a provider job"
+                    )
+                if provenance.get("leader") is None or provenance.get("job_id") is not None:
+                    _fail(
+                        "Strict-execution Codex submissions require --leader and "
+                        "must not claim a provider job identity"
+                    )
+            else:
+                evidence = _strict_source_evidence(
+                    plan_id=plan_id,
+                    step_id=step_id,
+                    role=role,
+                    round_number=round_number,
+                    cycle=current["cycle"],
+                    candidate_sha256=None,
+                    source=source,
+                )
+                source_evidence = _source_evidence_record(evidence)
+                effective_provenance = {
+                    "job_id": evidence["job_id"],
+                    "leader": None,
+                }
+                mapped = normalize_provider_mapping(
+                    provider_operation_for_round(round_number),
+                    evidence["payload"],
+                )
+                if round_number == 1:
+                    submitted = _validate_proposal(submission_raw)
+                else:
+                    submitted = _normalize_cross_without_ids(submission_raw)
+                if mapped != submitted or _digest(submitted) != evidence["mapped_sha256"]:
+                    _fail(
+                        "Strict-execution submission does not equal the deterministic "
+                        "mapping of the settled provider payload"
+                    )
+        elif source is not None:
+            _fail(
+                "--source-job provenance is available only for strict-execution plans"
+            )
         if round_number == 1:
             submission = _validate_proposal(submission_raw)
             event_type = "proposal_recorded"
@@ -4496,18 +5602,21 @@ def submit_consensus(
             for objection in objections:
                 objection["role"] = role
             event_type = "cross_examination_recorded"
+        payload: dict[str, Any] = {
+            "role": role,
+            "provenance": effective_provenance,
+            "submission": submission,
+            "retry_id": retry_id,
+        }
+        if source_evidence is not None:
+            payload["source_evidence"] = source_evidence
         return [
             {
                 "type": event_type,
                 "step_id": step_id,
                 "cycle": current["cycle"],
                 "round": round_number,
-                "payload": {
-                    "role": role,
-                    "provenance": provenance,
-                    "submission": submission,
-                    "retry_id": retry_id,
-                },
+                "payload": payload,
             }
         ]
 
@@ -4542,7 +5651,12 @@ def freeze_candidate(
             _stage_error(stage, STAGE_CANDIDATE)
         step = _manifest_step_for(state, step_id)
         objection_ids = [item["objection_id"] for item in current["objections"]]
-        candidate = _validate_candidate(candidate_raw, objection_ids)
+        candidate = _validate_candidate(
+            candidate_raw,
+            objection_ids,
+            step,
+            strict=_plan_is_strict(state["static"]),
+        )
         binding = _binding_for(state["static"], step, current["cycle"])
         digest = _candidate_digest(binding, candidate)
         return [
@@ -4582,6 +5696,7 @@ def cast_ballot(
     leader: str | None,
     retry_id: str | None,
     operation_id: str | None,
+    source: Any = None,
 ) -> dict[str, Any]:
     _require_active_role(role)
     if vote not in VOTES:
@@ -4594,17 +5709,19 @@ def cast_ballot(
         if not isinstance(retry_id, str) or not RETRY_ID_RE.fullmatch(retry_id):
             _fail(f"Invalid retry ID: {retry_id!r}")
     provenance = _provenance({"job_id": job_id, "leader": leader}, "ballot.provenance")
-    request_digest = _request_digest(
-        "consensus-vote",
-        plan_id=plan_id,
-        step_id=step_id,
-        role=role,
-        digest=digest,
-        vote=vote,
-        rationale=rationale,
-        provenance=provenance,
-        retry_id=retry_id,
-    )
+    ballot_fields = {
+        "plan_id": plan_id,
+        "step_id": step_id,
+        "role": role,
+        "digest": digest,
+        "vote": vote,
+        "rationale": rationale,
+        "provenance": provenance,
+        "retry_id": retry_id,
+    }
+    if source is not None:
+        ballot_fields["source"] = source
+    request_digest = _request_digest("consensus-vote", **ballot_fields)
 
     def builder(state: dict[str, Any]) -> list[dict[str, Any]]:
         current = _require_step_state(state, step_id)
@@ -4635,27 +5752,78 @@ def cast_ballot(
                     f"Retry ID {retry_id!r} does not match the open pause "
                     f"{pause['retry_id']!r}"
                 )
+        strict = _plan_is_strict(state["static"])
+        source_evidence: dict[str, Any] | None = None
+        effective_vote = vote
+        effective_rationale = rationale
+        effective_provenance = provenance
+        if strict:
+            if role == "codex":
+                if source is not None:
+                    _fail(
+                        "Codex strict-mode ballots use the active coordinator "
+                        "leader identity, not a provider job"
+                    )
+                if provenance.get("leader") is None or provenance.get("job_id") is not None:
+                    _fail(
+                        "Strict-execution Codex ballots require --leader and must "
+                        "not claim a provider job identity"
+                    )
+            else:
+                evidence = _strict_source_evidence(
+                    plan_id=plan_id,
+                    step_id=step_id,
+                    role=role,
+                    round_number=3,
+                    cycle=current["cycle"],
+                    candidate_sha256=current["candidate"]["digest"],
+                    source=source,
+                )
+                mapped = normalize_provider_mapping("consensus", evidence["payload"])
+                if (
+                    mapped["vote"] != vote
+                    or mapped["digest"] != digest
+                    or mapped["rationale"] != (rationale or "")
+                ):
+                    _fail(
+                        "Strict-execution ballot does not equal the deterministic "
+                        "mapping of the settled provider consensus payload"
+                    )
+                source_evidence = _source_evidence_record(evidence)
+                effective_vote = mapped["vote"]
+                effective_rationale = mapped["rationale"]
+                effective_provenance = {
+                    "job_id": evidence["job_id"],
+                    "leader": None,
+                }
+        elif source is not None:
+            _fail(
+                "--source-job provenance is available only for strict-execution plans"
+            )
+        ballot_payload: dict[str, Any] = {
+            "role": role,
+            "vote": effective_vote,
+            "rationale": effective_rationale,
+            "digest": digest,
+            "provenance": effective_provenance,
+            "retry_id": retry_id,
+        }
+        if source_evidence is not None:
+            ballot_payload["source_evidence"] = source_evidence
         specs = [
             {
                 "type": "ballot_recorded",
                 "step_id": step_id,
                 "cycle": current["cycle"],
                 "round": 3,
-                "payload": {
-                    "role": role,
-                    "vote": vote,
-                    "rationale": rationale,
-                    "digest": digest,
-                    "provenance": provenance,
-                    "retry_id": retry_id,
-                },
+                "payload": ballot_payload,
             }
         ]
         preview = {
             **current,
             "ballots": {
                 **current["ballots"],
-                role: {"role": role, "vote": vote},
+                role: {"role": role, "vote": vote if not strict else effective_vote},
             },
         }
         if len(preview["ballots"]) == len(_state_roles(current)):
@@ -4805,16 +5973,23 @@ def authorize_new_cycle(
     authorized_by: str,
     authorization: str,
     operation_id: str | None,
+    authorization_kind: str | None = None,
 ) -> dict[str, Any]:
     authorized_by = _text(authorized_by, "authorized-by", minimum=2)
     authorization = _text(authorization, "authorization", minimum=10)
-    request_digest = _request_digest(
-        "consensus-new-cycle",
-        plan_id=plan_id,
-        step_id=step_id,
-        authorized_by=authorized_by,
-        authorization=authorization,
-    )
+    if authorization_kind is not None and authorization_kind not in AUTHORIZATION_KINDS:
+        _fail(
+            "authorization-kind must be 'human' or 'coordinator' when supplied"
+        )
+    cycle_fields = {
+        "plan_id": plan_id,
+        "step_id": step_id,
+        "authorized_by": authorized_by,
+        "authorization": authorization,
+    }
+    if authorization_kind is not None:
+        cycle_fields["authorization_kind"] = authorization_kind
+    request_digest = _request_digest("consensus-new-cycle", **cycle_fields)
 
     def builder(state: dict[str, Any]) -> list[dict[str, Any]]:
         current = _require_step_state(state, step_id)
@@ -4823,6 +5998,42 @@ def authorize_new_cycle(
             _stage_error(stage, f"{STAGE_HUMAN} or {STAGE_CONSENSUS}")
         candidate = current.get("candidate") or {}
         new_cycle = current["cycle"] + 1
+        strict = _plan_is_strict(state["static"])
+        if strict:
+            # A reopen is a B1 mutation. Every live, pending or uncertain D1
+            # writer intent/claim/attempt must be reconciled first.
+            guard = _HOOKS.get("execution_cycle_guard")
+            if guard is None:
+                _fail(
+                    "Strict-execution cycle mutation guard is unavailable; failing "
+                    "closed"
+                )
+            error_type = _hook("runner_error")
+            try:
+                blocker = guard(plan_id=plan_id, step_id=step_id)
+            except error_type:
+                raise
+            except Exception as exc:
+                _fail(f"Strict-execution cycle mutation guard failed: {exc}")
+            if blocker:
+                _fail(str(blocker))
+            if authorization_kind is None:
+                _fail(
+                    "Strict-execution new cycles require --authorization-kind "
+                    "'human' or 'coordinator'"
+                )
+            if stage == STAGE_HUMAN and authorization_kind != "human":
+                _fail(
+                    "A non-unanimous cycle can only reopen through an honest human "
+                    "authorization; coordinator-requested consensus is available "
+                    "only after a successful unanimous cycle"
+                )
+        authorization_payload = {
+            "authorized_by": authorized_by,
+            "text": authorization,
+        }
+        if authorization_kind is not None:
+            authorization_payload["authorization_kind"] = authorization_kind
         return [
             {
                 "type": "new_cycle_authorized",
@@ -4833,10 +6044,7 @@ def authorize_new_cycle(
                     "previous_cycle": current["cycle"],
                     "previous_outcome": stage,
                     "previous_digest": candidate.get("digest"),
-                    "authorization": {
-                        "authorized_by": authorized_by,
-                        "text": authorization,
-                    },
+                    "authorization": authorization_payload,
                     "new_cycle": new_cycle,
                 },
             }

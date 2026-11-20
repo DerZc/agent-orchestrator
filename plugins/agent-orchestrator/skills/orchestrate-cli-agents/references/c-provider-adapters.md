@@ -150,6 +150,49 @@ The outer invocation is wrapped by `bwrap`, not only a selected child:
   namespace creation and that an ordinary inherited descriptor reaches the sandboxed command,
   because the capture handshake depends on the same mechanism.
 
+Reserved-provider availability probes are themselves confined. `doctor`, `catalog`, `choices`
+and the legacy/launch admission paths run `bash --rcfile ... -ic 'declare -F <provider>'` inside
+bubblewrap with a read-only root and an unshared network namespace, before any provider function
+or model dispatch. Missing bubblewrap is an explicit `isolation_unavailable`; there is no
+direct-shell fallback, so an rcfile startup side effect cannot write the workspace or consume a
+provider quota during an availability check.
+
+### D1 protected-execution seam (optional, typed)
+
+`run_provider` accepts an optional typed `protection` object containing a version, a manifest
+SHA-256 and workspace-relative `roots`/`anchors` (the C mount plan is derived and owned by C,
+never by the writer):
+
+```json
+{
+  "version": 1,
+  "manifest_sha256": "<64 hex>",
+  "roots": [{"path": "local.sql", "kind": "file"}],
+  "anchors": [{"path": "other"}]
+}
+```
+
+Validation is bounded and fail-closed: 256 roots, 1,024 anchors and 128 KiB encoded extra mount
+argv; paths must be relative, canonical, strictly inside the workspace, free of symlinked or
+special ancestors, non-nested, and free of Git/scratch/channel collisions. Readonly capability
+never accepts writable anchors. Empty/default inputs preserve the historical argv byte-for-byte.
+For workspace-write jobs the mount order is: whole-project RW, parent-first same-path RW
+ancestor anchors, Git RO, protected roots RO, then scratch/channel RW.
+
+When roots are declared, C writes a private check script and check set into the job directory
+and prepends a small wrapper command. The wrapper reads the actual mount table inside the
+claimed namespace (`/proc/self/mountinfo`) before the provider rcfile is loaded, verifies that
+each protected root is read-only (and has no writable mount beneath it), and that each anchor,
+workspace, scratch and channel is writable. It reports a nonce-bound status line on a dedicated
+inherited descriptor; C refuses to acknowledge the capture handshake or start the provider if
+the status is missing, malformed, timed out or failed. The provider-result gains a versioned
+`confinement` object containing the manifest digest, mount-plan digest, extra-argv byte count,
+actual bubblewrap argv digest, and application evidence (`verified`, checked count, nonce/status
+digests). D1 compares that object to the coordinator-owned manifest and rejects provider echoes,
+argv assertions alone, or a non-confining transport shim as protection. A run with an empty
+declared protected set records an explicit `empty-protected-set` coverage statement instead of
+claiming a mount was applied.
+
 Claude Code is invoked through the unchanged user function with:
 `-p --output-format stream-json --verbose --permission-mode ... --tools ... --allowedTools ...
 --disallowedTools ... --strict-mcp-config --mcp-config '{"mcpServers":{}}'
@@ -209,9 +252,28 @@ directory, which is not provider-writable.
     "stderr_truncated": false,
     "stderr_tail": "optional sanitized tail"
   },
-  "captured_at": "ISO-8601"
+  "captured_at": "ISO-8601",
+  "confinement": {
+    "version": 1,
+    "manifest_sha256": "<bound D1 manifest digest>",
+    "plan_sha256": "<ordered mount plan>",
+    "capability": "workspace_write",
+    "counts": {"protected_roots": 1, "ancestor_anchors": 1, "extra_mount_argv_bytes": 185},
+    "bwrap_argv_sha256": "<actual argv>",
+    "application": {
+      "method": "in-namespace-mountinfo",
+      "verified": true,
+      "checked": 5,
+      "nonce_sha256": "<nonce digest>",
+      "status_sha256": "<status line digest>",
+      "errors": []
+    }
+  }
 }
 ```
+
+`confinement` is present only for protected D1 invocations; legacy calls that pass no typed
+protection keep the original result shape and argv.
 
 `result.json` and job metadata receive a compact `provider_result` summary and a
 `provider_error` object; they do not duplicate the full payload. The sanitized `stdout.log` and
@@ -293,11 +355,14 @@ killed and reported as `output_limit`; incomplete output is `invalid_output`.
 - C owns canonical path/symlink validation, capability binding, capture, isolation, result
   validation and the evidence primitive. D supplies immutable task/evidence entries and the
   authorization/review gates that consume these results.
-- B2 keeps content/scope attribution and completion receipts. File-scope enforcement is B2
-  detection, not per-file operating-system prevention.
-- The wrapper function and startup context are trusted local user configuration. C validates
-  shape and confines the outer invocation, but does not attempt to sandbox malicious rcfile
-  code that runs before the wrapper.
+- B2 keeps content/scope attribution and completion receipts. The D1 protection seam adds
+  OS-level read-only prevention for the declared original protected-user set and Git custody;
+  clean tracked out-of-scope writes remain B2 detection (scope violation with no rollback), not
+  a claim of universal per-file prevention.
+- The wrapper function and startup context are trusted local user configuration. C confines the
+  outer invocation, including rcfile startup and availability probes, but does not audit or
+  redact arbitrary rcfile behavior beyond the sandbox. Availability probes never dispatch the
+  provider function or a model, and do not persist startup output.
 - The workspace `.git` entry (directory or linked-worktree marker file) and the resolved
   administrative/common directories are protected as mount policy; B2 remains authoritative
   for content attribution. This is OS-level mount prevention for those paths, not general
