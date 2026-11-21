@@ -2187,31 +2187,71 @@ def _coordinator_state_root() -> Path | None:
     return Path(text) if text else None
 
 
-def _sensitive_env_name(name: str) -> bool:
+# Credential-value redaction and child-environment isolation are distinct
+# decisions. The deny list above deliberately covers benign metadata and
+# startup-control variables (``GITHUB_JOB=test``, ``GITHUB_RUN_ATTEMPT=1``,
+# ``CI=true``, provider config, ...) in addition to credential holders. Its
+# values must never seed the redactor: a short metadata value such as ``test``
+# or ``1`` would then corrupt trusted adapter/run identities, timestamps and
+# captures during mandatory structure sanitization.
+#
+# Only names that actually hold credential values seed the redactor. C's
+# existing provider-credential classifier is the authority (the same classifier
+# the provider capture path uses); the bounded supplement below adds credential
+# values its lexical segments cannot name. Short real credential values stay
+# classified - there is deliberately no minimum-length shortcut here.
+CREDENTIAL_VALUE_ENV_NAMES = frozenset(
+    {
+        # JSON registry-auth blob holding base64 user/password entries; the
+        # name contains no TOKEN/PASSWORD/SECRET/CREDENTIAL segment.
+        "DOCKER_AUTH_CONFIG",
+    }
+)
+
+# A real configured environment may spell the compact key marker without the
+# separator (``DEEPSEEK_APIKEY``). C's compound classifier matches only
+# ``API_KEY``, so such a value would otherwise never seed the redactor. This
+# is a bounded terminal-segment rule on exactly ``_APIKEY``; it never infers
+# credentials from a provider prefix or an arbitrary substring.
+CREDENTIAL_VALUE_ENV_SUFFIXES = ("_APIKEY",)
+
+
+def _denied_child_env_name(name: str) -> bool:
+    """Broad ambient-environment isolation list for validation children."""
     upper = name.upper()
     if upper in DENIED_ENV_NAMES:
         return True
-    if any(upper.startswith(prefix) for prefix in DENIED_ENV_PREFIXES):
+    return any(upper.startswith(prefix) for prefix in DENIED_ENV_PREFIXES)
+
+
+def _credential_env_name(name: str, c: Any | None = None) -> bool:
+    """Classify a variable name as holding an actual credential value."""
+    upper = name.upper()
+    if upper in CREDENTIAL_VALUE_ENV_NAMES:
         return True
-    try:
-        return bool(_hook("c_module")().is_sensitive_name(name))
-    except Exception:
-        return False
+    if upper.endswith(CREDENTIAL_VALUE_ENV_SUFFIXES):
+        return True
+    module = c if c is not None else _hook("c_module")()
+    return bool(module.is_sensitive_name(name))
 
 
 def _review_redactor() -> Any:
-    """Collect known sensitive env values in memory, never on disk.
+    """Collect known credential env values in memory, never on disk.
 
     The resulting redactor is used before any framework-managed capture file,
     blob, head text or structured diagnostic is persisted. Values and their
     definitions are never serialized; only redacted bytes are.
+
+    Only genuine credential values are collected; the broader child-environment
+    deny list is applied separately by ``_validation_env`` and never becomes a
+    redaction pattern.
     """
     c = _hook("c_module")()
     secrets: list[bytes] = []
     for name, value in os.environ.items():
         if not value or len(value) > 65_536:
             continue
-        if _sensitive_env_name(name):
+        if _credential_env_name(name, c):
             secrets.append(value.encode("utf-8", "surrogatepass"))
     return c.Redactor(secrets)
 
@@ -2576,10 +2616,7 @@ def _validation_env(
             else str(report_path)
         )
     for name in list(env):
-        upper = name.upper()
-        if upper in DENIED_ENV_NAMES or any(
-            upper.startswith(prefix_name) for prefix_name in DENIED_ENV_PREFIXES
-        ):
+        if _denied_child_env_name(name):
             env.pop(name, None)
     identity = {
         "keys": sorted(env),

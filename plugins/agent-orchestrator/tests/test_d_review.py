@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -393,9 +394,17 @@ class D2ReviewRepairTests(unittest.TestCase):
         The real bubblewrap (when the host supports it) and absolute Python are
         used by the validator. On the capability-dropped native bootstrap the
         positive chain test is skipped rather than supplied a fake wrapper.
+
+        Synthetic benign GitHub metadata is injected so the genuine normal-CLI
+        validation path deterministically covers the D2-CI-001 conditions on
+        hosts (including CI) that do not set these values themselves. It must
+        be filtered from the child environment but never treated as a
+        credential value by the parent redactor.
         """
         local = dict(self.env)
         local["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+        local["GITHUB_JOB"] = "test"
+        local["GITHUB_RUN_ATTEMPT"] = "1"
         return local
 
     def write_rcfile(self, path: Path) -> None:
@@ -2884,6 +2893,325 @@ class D2ReviewRepairTests(unittest.TestCase):
         self.assertNotIn(secret, dumped)
         self.assertIn("[REDACTED]", dumped)
         self.assertNotIn(secret, report.read_text())
+
+    def test_benign_ci_metadata_preserves_structured_identity(self) -> None:
+        """D2-CI-001: benign GitHub metadata must not become a secret pattern.
+
+        Both actual GitHub runs corrupted the trusted adapter/run identity
+        because ``GITHUB_JOB=test`` and ``GITHUB_RUN_ATTEMPT=1`` seeded the
+        literal values ``test`` and ``1`` into the value redactor. This pins
+        the exact sanitization boundary with a genuine adapter process: the
+        metadata must still be stripped from the child environment, while the
+        identity, timestamps and counts that legitimately contain those
+        substrings survive mandatory structure sanitization untouched.
+        """
+        review = runner.review_module()
+        work = self.root / "ci-metadata"
+        tests = work / "tests"
+        tests.mkdir(parents=True)
+        (tests / "test_metadata.py").write_text(
+            "import unittest\n"
+            "class MetadataTests(unittest.TestCase):\n"
+            "    def test_alpha(self):\n"
+            "        self.assertTrue(True)\n"
+            "    def test_beta(self):\n"
+            "        self.assertEqual(1 + 1, 2)\n",
+            encoding="utf-8",
+        )
+        report = work / "report.json"
+        run_id = "run-1"
+        argv = [
+            sys.executable,
+            "-I",
+            str(D_REVIEW),
+            "_unittest-adapter",
+            "discover",
+            "-s",
+            "tests",
+            "-p",
+            "test_*.py",
+        ]
+        child_env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "D2_STRUCTURED_REPORT": str(report),
+            "D2_STRUCTURED_RUN_ID": run_id,
+        }
+        controlled = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "GITHUB_JOB": "test",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_RUN_ID": "1234567890",
+            "CI": "true",
+        }
+        with mock.patch.dict(os.environ, controlled, clear=True):
+            redactor = review._review_redactor()
+            scratch = work / "scratch"
+            scratch.mkdir()
+            env, env_identity = review._validation_env(
+                scratch,
+                "D2_STRUCTURED_REPORT",
+                report,
+                run_id,
+                sandboxed=False,
+            )
+            # The broad child isolation filter is unchanged: denied metadata
+            # names never reach the validation child.
+            for name in (
+                "GITHUB_JOB",
+                "GITHUB_RUN_ATTEMPT",
+                "GITHUB_ACTIONS",
+                "GITHUB_RUN_ID",
+                "CI",
+            ):
+                self.assertNotIn(name, env)
+            self.assertEqual(env["D2_STRUCTURED_RUN_ID"], run_id)
+            self.assertIn("GITHUB", env_identity["stripped_prefixes"])
+            self.assertIn("CI_", env_identity["stripped_prefixes"])
+            self.assertIn("PYTHONPATH", env_identity["stripped_names"])
+            result = subprocess.run(
+                argv,
+                cwd=work,
+                env=child_env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            original = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(original["adapter_id"], review.DEFAULT_ADAPTER_ID)
+            self.assertEqual(original["run_id"], run_id)
+            entry = {
+                "evidence": {
+                    "kind": "structured_unittest",
+                    "adapter": {
+                        "id": review.DEFAULT_ADAPTER_ID,
+                        "version": 1,
+                        "path": str(D_REVIEW),
+                        "sha256": hashlib.sha256(D_REVIEW.read_bytes()).hexdigest(),
+                    },
+                    "report_env": "D2_STRUCTURED_REPORT",
+                    "min_collected": 2,
+                    "min_run": 2,
+                }
+            }
+            payload, reasons = review._structured_report(
+                report,
+                entry=entry,
+                run_id=run_id,
+                argv=argv,
+                cwd=work,
+                actual_exit=0,
+                redactor=redactor,
+            )
+        self.assertEqual(reasons, [])
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["adapter_id"], review.DEFAULT_ADAPTER_ID)
+        self.assertEqual(payload["run_id"], run_id)
+        self.assertEqual(payload["python"], original["python"])
+        self.assertEqual(payload["started_at"], original["started_at"])
+        self.assertEqual(payload["finished_at"], original["finished_at"])
+        self.assertEqual(payload["counts"], original["counts"])
+        self.assertEqual(payload["counts"]["run"], 2)
+        # "test" and "1" are real substrings of the adapter identity, version,
+        # timestamps and counts here, so any leaked metadata pattern shows up.
+        self.assertNotIn("[REDACTED]", json.dumps(payload))
+        persisted = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["adapter_id"], review.DEFAULT_ADAPTER_ID)
+        self.assertEqual(persisted["run_id"], run_id)
+
+    def test_ci_metadata_does_not_weaken_credential_redaction(self) -> None:
+        """D2-CI-001: separating metadata from credentials keeps real secrets.
+
+        Short real credentials and generic secret names must stay classified
+        even while benign CI metadata is present, in raw, JSON-escaped and
+        chunk-split captures and in structured identities/diagnostics.
+        """
+        review = runner.review_module()
+        c = runner.c_module()
+        short_token = "tk9"
+        short_password = "pw1"
+        registry_auth = "dXNlcjpwYXNz"
+        controlled = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "GITHUB_JOB": "test",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "CI": "true",
+            "GH_TOKEN": short_token,
+            "DB_PASSWORD": short_password,
+            "DOCKER_AUTH_CONFIG": (
+                '{"auths":{"registry":{"auth":"' + registry_auth + '"}}}'
+            ),
+        }
+        with mock.patch.dict(os.environ, controlled, clear=True):
+            redactor = review._review_redactor()
+            registry_value = controlled["DOCKER_AUTH_CONFIG"]
+            spellings = (
+                (
+                    b"token "
+                    + short_token.encode()
+                    + b" password "
+                    + short_password.encode(),
+                    (short_token.encode(), short_password.encode()),
+                ),
+                (
+                    json.dumps(
+                        {"token": short_token, "password": short_password}
+                    ).encode("utf-8"),
+                    (short_token.encode(), short_password.encode()),
+                ),
+                (
+                    registry_value.encode("utf-8"),
+                    (registry_value.encode("utf-8"), registry_auth.encode()),
+                ),
+                (
+                    json.dumps(registry_value).encode("utf-8"),
+                    (registry_auth.encode(),),
+                ),
+            )
+            for data, forbidden in spellings:
+                clean = review._sanitize_capture(
+                    data, overflow=False, redactor=redactor
+                )
+                for raw in forbidden:
+                    self.assertNotIn(raw, clean)
+                self.assertIn(b"[REDACTED]", clean)
+            # The same credential split across real reader chunks is removed.
+            buffer = c.CaptureBuffer(4096)
+            buffer.feed(b"chunk-one tk")
+            buffer.feed(b"9 chunk-two pw")
+            buffer.feed(b"1")
+            clean = c.sanitize_capture(buffer, redactor)
+            self.assertNotIn(short_token.encode(), clean)
+            self.assertNotIn(short_password.encode(), clean)
+            self.assertIn(b"[REDACTED]", clean)
+            # Structured identities and diagnostics are still sanitized, and
+            # the surrounding run identity is not corrupted by the metadata.
+            argv = ["python3", "-m", "unittest"]
+            report = self.root / "credential-report.json"
+            document = {
+                "version": 1,
+                "adapter_id": review.DEFAULT_ADAPTER_ID,
+                "adapter_version": 1,
+                "run_id": "run-1",
+                "argv": argv,
+                "argv_sha256": review._digest(argv),
+                "cwd": str(self.repo),
+                "python": "3.12.0",
+                "started_at": "start",
+                "finished_at": "finish",
+                "counts": {
+                    "collected": 1,
+                    "run": 1,
+                    "passed": 0,
+                    "failures": 1,
+                    "errors": 0,
+                    "skips": 0,
+                },
+                "identities": {
+                    "failures": [f"test_{short_token}"],
+                    "errors": [],
+                    "skips": [],
+                    "expected_failures": [],
+                    "unexpected_successes": [],
+                },
+                "adapter_error": (
+                    f"diagnostic included {short_password} and {registry_value}"
+                ),
+            }
+            report.write_text(json.dumps(document), encoding="utf-8")
+            entry = {
+                "evidence": {
+                    "kind": "structured_unittest",
+                    "adapter": {
+                        "id": review.DEFAULT_ADAPTER_ID,
+                        "version": 1,
+                        "path": str(D_REVIEW),
+                        "sha256": hashlib.sha256(D_REVIEW.read_bytes()).hexdigest(),
+                    },
+                    "report_env": "D2_STRUCTURED_REPORT",
+                    "min_collected": 1,
+                    "min_run": 1,
+                }
+            }
+            payload, _reasons = review._structured_report(
+                report,
+                entry=entry,
+                run_id="run-1",
+                argv=argv,
+                cwd=self.repo,
+                actual_exit=1,
+                redactor=redactor,
+            )
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["adapter_id"], review.DEFAULT_ADAPTER_ID)
+        self.assertEqual(payload["run_id"], "run-1")
+        dumped = json.dumps(payload)
+        for raw in (short_token, short_password, registry_auth, registry_value):
+            self.assertNotIn(raw, dumped)
+        self.assertEqual(
+            payload["identities"]["failures"], ["test_[REDACTED]"]
+        )
+        self.assertEqual(
+            payload["adapter_error"],
+            "diagnostic included [REDACTED] and [REDACTED]",
+        )
+        persisted_text = report.read_text(encoding="utf-8")
+        for raw in (
+            short_token,
+            short_password,
+            registry_auth,
+            registry_value,
+        ):
+            self.assertNotIn(raw, persisted_text)
+
+    def test_compact_apikey_alias_seeds_redactor_without_ci_metadata(self) -> None:
+        """D2-CI-002: compact ``_APIKEY`` names hold credential values.
+
+        The real configured environment spells a provider credential as
+        ``DEEPSEEK_APIKEY``; C's compound classifier only knows ``API_KEY``,
+        so this value previously stayed unredacted. The bounded terminal
+        ``_APIKEY`` rule must classify it (and a purely synthetic alias)
+        without letting benign GitHub metadata seed redaction patterns.
+        """
+        review = runner.review_module()
+        alias_value = "synth-compact-alias-9357"
+        encoded = alias_value.encode("utf-8")
+        controlled = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "GITHUB_JOB": "test",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_RUN_ID": "1234567890",
+            "CI": "true",
+        }
+        for alias_name in ("DEEPSEEK_APIKEY", "D2_SYNTHETIC_APIKEY"):
+            with self.subTest(alias=alias_name):
+                local = dict(controlled)
+                local[alias_name] = alias_value
+                with mock.patch.dict(os.environ, local, clear=True):
+                    # Neither the separator spelling nor any other auth
+                    # variable is present: classification comes from the
+                    # terminal _APIKEY segment alone.
+                    self.assertNotIn("DEEPSEEK_API_KEY", os.environ)
+                    redactor = review._review_redactor()
+                    clean = review._sanitize_capture(
+                        b"credential " + encoded + b" end",
+                        overflow=False,
+                        redactor=redactor,
+                    )
+                    identity = b"adapter-test-run-1-true-1234567890"
+                    untouched = review._sanitize_capture(
+                        identity, overflow=False, redactor=redactor
+                    )
+                self.assertNotIn(encoded, clean)
+                self.assertIn(b"[REDACTED]", clean)
+                # GITHUB_JOB=test, GITHUB_RUN_ATTEMPT=1, GITHUB_ACTIONS=true
+                # and GITHUB_RUN_ID are still present in this environment and
+                # must remain ordinary text in trusted identities.
+                self.assertEqual(untouched, identity)
 
     def test_validation_entry_schema_boundaries(self) -> None:
         review = runner.review_module()
