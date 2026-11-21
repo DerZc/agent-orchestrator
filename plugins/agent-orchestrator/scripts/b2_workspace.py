@@ -75,6 +75,7 @@ LEASE_STATES = LEASE_ACTIVE_STATES | LEASE_TERMINAL_STATES
 EPOCH_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_LEASE_ERROR_BYTES = 4096
 MAX_EVIDENCE_BYTES = 8192
+MAX_COMPLETION_EVIDENCE_FILE_BYTES = 64 * 1024 * 1024
 MAX_START_IDENTITY_BYTES = 64
 CANCEL_GRACE_SECONDS = 5.0
 
@@ -3538,6 +3539,31 @@ def finalize_after_descendants(
         violations = []
         final_state = "error"
         final_error = f"{type(exc).__name__}: {exc}"
+    declared_evidence: dict[str, dict[str, Any]] = {}
+    declared = meta.get("completion_evidence_files")
+    if isinstance(declared, list):
+        for name in declared[:8]:
+            if (
+                not isinstance(name, str)
+                or not name
+                or "/" in name
+                or "\\" in name
+                or name in {".", ".."}
+            ):
+                continue
+            path = job_dir / name
+            try:
+                if not path.is_file() or path.is_symlink():
+                    continue
+                size = path.stat().st_size
+                if size < 0 or size > MAX_COMPLETION_EVIDENCE_FILE_BYTES:
+                    continue
+                declared_evidence[name] = {
+                    "sha256": _sha256_file(path),
+                    "bytes": size,
+                }
+            except OSError:
+                continue
     final = {
         **base,
         "state": final_state,
@@ -3545,6 +3571,7 @@ def finalize_after_descendants(
         "violations": violations,
         "error": final_error,
         "descendants": drain or {"reaped": 0, "terminated": terminated},
+        "evidence_files": declared_evidence,
     }
     _write_json(evidence_path, final)
     compact = _compact_final_check(final)

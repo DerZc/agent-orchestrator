@@ -126,6 +126,26 @@ MAX_STEP_BYTES = 16_384
 # never contain them and therefore keep their exact original bytes and digests.
 STRICT_EXECUTION_KEY = "strict_execution"
 EXECUTION_CONSTRAINTS_VERSION = 1
+# D2 extends the candidate schema only for strict-execution plans. Version 1
+# candidates keep their exact original normalization, bytes and digest; a new
+# explicit version 2 binds the independently executed validation policy before
+# any ballot. Missing policy never upgrades an old candidate.
+D2_EXECUTION_CONSTRAINTS_VERSION = 2
+D2_VALIDATION_POLICY_VERSION = 1
+MAX_D2_VALIDATION_ENTRIES = 32
+MAX_D2_VALIDATION_TIMEOUT = 3_600
+MAX_D2_CAPTURE_LIMIT = 8 * 1024 * 1024
+MIN_D2_CAPTURE_LIMIT = 1_024
+VALIDATION_INVOCATION_ID_RE = re.compile(r"^V[0-9]{3}$")
+VALIDATION_ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+VALIDATION_CONTEXTS = {"ordinary_ro", "systems_trusted"}
+VALIDATION_EVIDENCE_KINDS = {"command_check", "structured_unittest"}
+VALIDATION_ENVIRONMENT_POLICIES = {"minimal_private"}
+# The frozen candidate admits only the two measured contexts (ordinary_ro and
+# systems_trusted), both of which require actual kernel read-only enforcement.
+# An "observed" or otherwise unconfined context was rejected before the vote and
+# can never be made eligible by a policy field.
+VALIDATION_RO_ENFORCEMENT = {"required"}
 MAX_CONSTRAINT_PATTERNS = 64
 MAX_CONSTRAINT_CRITERIA = 50
 MAX_VALIDATION_COMMANDS = 32
@@ -702,10 +722,228 @@ def _validate_validation_commands(raw: Any) -> list[dict[str, Any]]:
     return commands
 
 
+def _validate_validation_argv(raw: Any, label: str) -> list[str]:
+    if not isinstance(raw, list) or not raw:
+        _fail(f"{label} must be a non-empty literal argument array")
+    if len(raw) > MAX_VALIDATION_ARGV:
+        _fail(f"{label} has too many arguments")
+    normalized: list[str] = []
+    for index, argument in enumerate(raw):
+        if not isinstance(argument, str) or not argument:
+            _fail(f"{label}[{index}] must be a non-empty string")
+        if len(argument.encode("utf-8")) > MAX_VALIDATION_ARG_BYTES:
+            _fail(f"{label}[{index}] exceeds {MAX_VALIDATION_ARG_BYTES} bytes")
+        if "\x00" in argument or "\n" in argument or "\r" in argument:
+            _fail(f"{label}[{index}] must be one literal argument")
+        normalized.append(argument)
+    return normalized
+
+
+def _validate_validation_cwd(raw: Any, label: str) -> str:
+    if not isinstance(raw, str) or not raw:
+        _fail(f"{label} must be a repository-relative directory")
+    if len(raw.encode("utf-8")) > MAX_PATTERN_BYTES:
+        _fail(f"{label} exceeds {MAX_PATTERN_BYTES} bytes")
+    if "\x00" in raw or raw.startswith("/"):
+        _fail(f"{label} must be repository-relative without NUL bytes")
+    parts = Path(raw).parts
+    if any(part == ".." for part in parts):
+        _fail(f"{label} must not escape the repository")
+    if parts and parts[0] == ".git":
+        _fail(f"{label} must not target Git metadata")
+    return raw
+
+
+def _validate_d2_validation_evidence(raw: Any, label: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        _fail(f"{label} must be a JSON object")
+    kind = raw.get("kind")
+    if kind not in VALIDATION_EVIDENCE_KINDS:
+        _fail(f"{label}.kind must be command_check or structured_unittest")
+    if kind == "command_check":
+        _exact_keys(raw, {"kind"}, label)
+        return {"kind": "command_check"}
+    value = _exact_keys(
+        raw,
+        {"kind", "adapter", "report_env", "min_collected", "min_run"},
+        label,
+    )
+    adapter = _exact_keys(
+        value.get("adapter"), {"id", "version", "path", "sha256"},
+        f"{label}.adapter",
+    )
+    adapter_id = adapter.get("id")
+    if adapter_id != "coordinator-stdlib-unittest":
+        _fail(f"{label}.adapter.id must be the pinned coordinator adapter")
+    if adapter.get("version") != 1:
+        _fail(f"{label}.adapter.version is not supported")
+    path = adapter.get("path")
+    if not isinstance(path, str) or not path.startswith("/"):
+        _fail(f"{label}.adapter.path must be an absolute runtime path")
+    if len(path.encode("utf-8")) > MAX_VALIDATION_ARG_BYTES:
+        _fail(f"{label}.adapter.path exceeds the argument size bound")
+    digest = adapter.get("sha256")
+    if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+        _fail(f"{label}.adapter.sha256 must be a lowercase SHA-256 digest")
+    report_env = value.get("report_env")
+    if not isinstance(report_env, str) or not VALIDATION_ENV_RE.fullmatch(
+        report_env
+    ):
+        _fail(f"{label}.report_env must be a fixed environment variable name")
+    for key in ("min_collected", "min_run"):
+        item = value.get(key)
+        if (
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or not 1 <= item <= 1_000_000
+        ):
+            _fail(f"{label}.{key} must be a positive integer")
+    return {
+        "kind": "structured_unittest",
+        "adapter": {
+            "id": adapter_id,
+            "version": 1,
+            "path": path,
+            "sha256": digest,
+        },
+        "report_env": report_env,
+        "min_collected": value["min_collected"],
+        "min_run": value["min_run"],
+    }
+
+
+def _validate_d2_validation_entry(raw: Any, index: int) -> dict[str, Any]:
+    label = f"execution_constraints.validation_policy.entries[{index}]"
+    item = _exact_keys(
+        raw,
+        {
+            "invocation_id",
+            "label",
+            "argv",
+            "cwd",
+            "context",
+            "purpose",
+            "mandatory",
+            "expected_exit",
+            "timeout_seconds",
+            "capture_limit_bytes",
+            "environment_policy",
+            "ro_enforcement",
+            "evidence",
+        },
+        label,
+    )
+    invocation_id = item.get("invocation_id")
+    if not isinstance(
+        invocation_id, str
+    ) or not VALIDATION_INVOCATION_ID_RE.fullmatch(invocation_id):
+        _fail(f"{label}.invocation_id must match {VALIDATION_INVOCATION_ID_RE.pattern}")
+    if item.get("context") not in VALIDATION_CONTEXTS:
+        _fail(f"{label}.context must be ordinary_ro or systems_trusted")
+    if not isinstance(item.get("mandatory"), bool):
+        _fail(f"{label}.mandatory must be a boolean")
+    expected_exit = item.get("expected_exit")
+    if (
+        not isinstance(expected_exit, int)
+        or isinstance(expected_exit, bool)
+        or not 0 <= expected_exit <= 255
+    ):
+        _fail(f"{label}.expected_exit must be an integer between 0 and 255")
+    timeout = item.get("timeout_seconds")
+    if (
+        not isinstance(timeout, int)
+        or isinstance(timeout, bool)
+        or not 1 <= timeout <= MAX_D2_VALIDATION_TIMEOUT
+    ):
+        _fail(
+            f"{label}.timeout_seconds must be between 1 and "
+            f"{MAX_D2_VALIDATION_TIMEOUT}"
+        )
+    capture = item.get("capture_limit_bytes")
+    if (
+        not isinstance(capture, int)
+        or isinstance(capture, bool)
+        or not MIN_D2_CAPTURE_LIMIT <= capture <= MAX_D2_CAPTURE_LIMIT
+    ):
+        _fail(
+            f"{label}.capture_limit_bytes must be between "
+            f"{MIN_D2_CAPTURE_LIMIT} and {MAX_D2_CAPTURE_LIMIT}"
+        )
+    if item.get("environment_policy") not in VALIDATION_ENVIRONMENT_POLICIES:
+        _fail(f"{label}.environment_policy is not a supported policy")
+    if item.get("ro_enforcement") not in VALIDATION_RO_ENFORCEMENT:
+        _fail(
+            f"{label}.ro_enforcement must be required; observed or unconfined "
+            "read-only execution is not an eligible D2 context"
+        )
+    evidence = _validate_d2_validation_evidence(
+        item.get("evidence"), f"{label}.evidence"
+    )
+    return {
+        "invocation_id": invocation_id,
+        "label": _text(item.get("label"), f"{label}.label", minimum=2),
+        "argv": _validate_validation_argv(item.get("argv"), f"{label}.argv"),
+        "cwd": _validate_validation_cwd(item.get("cwd"), f"{label}.cwd"),
+        "context": item["context"],
+        "purpose": _text(item.get("purpose"), f"{label}.purpose", minimum=10),
+        "mandatory": item["mandatory"],
+        "expected_exit": expected_exit,
+        "timeout_seconds": timeout,
+        "capture_limit_bytes": capture,
+        "environment_policy": item["environment_policy"],
+        "ro_enforcement": item["ro_enforcement"],
+        "evidence": evidence,
+    }
+
+
+def _validate_d2_validation_policy(raw: Any) -> dict[str, Any]:
+    value = _exact_keys(raw, {"version", "entries"}, "execution_constraints.validation_policy")
+    if value.get("version") != D2_VALIDATION_POLICY_VERSION:
+        _fail("execution_constraints.validation_policy.version is not supported")
+    entries = value.get("entries")
+    if not isinstance(entries, list) or not entries:
+        _fail("execution_constraints.validation_policy.entries must be non-empty")
+    if len(entries) > MAX_D2_VALIDATION_ENTRIES:
+        _fail("execution_constraints.validation_policy has too many entries")
+    normalized = [
+        _validate_d2_validation_entry(entry, index)
+        for index, entry in enumerate(entries)
+    ]
+    ids = [entry["invocation_id"] for entry in normalized]
+    if len(set(ids)) != len(ids):
+        _fail("execution_constraints.validation_policy repeats an invocation ID")
+    argvs = [tuple(entry["argv"]) for entry in normalized]
+    if len(set(argvs)) != len(argvs):
+        _fail("execution_constraints.validation_policy repeats a literal argv")
+    mandatory = [entry for entry in normalized if entry["mandatory"]]
+    if not mandatory:
+        _fail("validation_policy requires at least one mandatory invocation")
+    if not any(
+        entry["evidence"]["kind"] == "structured_unittest" for entry in mandatory
+    ):
+        _fail(
+            "validation_policy requires at least one mandatory structured_unittest "
+            "invocation; command_check never invents test counts"
+        )
+    return {"version": D2_VALIDATION_POLICY_VERSION, "entries": normalized}
+
+
 def validate_execution_constraints(
     raw: Any, manifest_step: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Validate a version 1 candidate execution-constraints object."""
+    """Validate version 1 (D1) or version 2 (D2) execution constraints.
+
+    Version 1 is byte-for-byte the historical normalization. Version 2 adds one
+    explicit validation policy that is voted before execution; there is no
+    implicit upgrade path in either direction.
+    """
+    if not isinstance(raw, dict):
+        _fail("execution_constraints must be a JSON object")
+    version = raw.get("version")
+    if type(version) is int and version == D2_EXECUTION_CONSTRAINTS_VERSION:
+        return _validate_d2_execution_constraints(raw, manifest_step)
+    if type(version) is not int or version != EXECUTION_CONSTRAINTS_VERSION:
+        _fail("execution_constraints.version is not supported")
     value = _exact_keys(
         raw,
         {
@@ -718,9 +956,6 @@ def validate_execution_constraints(
         },
         "execution_constraints",
     )
-    version = value.get("version")
-    if type(version) is not int or version != EXECUTION_CONSTRAINTS_VERSION:
-        _fail("execution_constraints.version is not supported")
     allowed = _constraint_pattern_list(
         value.get("allowed_paths"), "execution_constraints.allowed_paths", minimum=1
     )
@@ -744,6 +979,72 @@ def validate_execution_constraints(
         "criteria": criteria,
         "required_validation": required,
         "max_changed_files": maximum,
+    }
+
+
+def _validate_d2_execution_constraints(
+    raw: dict[str, Any], manifest_step: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Normalize explicit version 2 constraints plus their validation policy."""
+    value = _exact_keys(
+        raw,
+        {
+            "version",
+            "allowed_paths",
+            "denied_paths",
+            "criteria",
+            "required_validation",
+            "max_changed_files",
+            "validation_policy",
+        },
+        "execution_constraints",
+    )
+    allowed = _constraint_pattern_list(
+        value.get("allowed_paths"), "execution_constraints.allowed_paths", minimum=1
+    )
+    denied = _constraint_pattern_list(
+        value.get("denied_paths"), "execution_constraints.denied_paths", minimum=0
+    )
+    criteria = _validate_execution_criteria(value.get("criteria"), manifest_step)
+    policy = _validate_d2_validation_policy(value.get("validation_policy"))
+    mandatory_mirror = [
+        {
+            "argv": list(entry["argv"]),
+            **({"label": entry["label"]} if entry.get("label") else {}),
+        }
+        for entry in policy["entries"]
+        if entry["mandatory"]
+    ]
+    required = _validate_validation_commands(value.get("required_validation"))
+    if required != mandatory_mirror:
+        _fail(
+            "execution_constraints.required_validation must mirror the ordered "
+            "mandatory validation_policy invocations exactly"
+        )
+    maximum = value.get("max_changed_files")
+    if maximum is not None and (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum <= 0
+        or maximum > 100_000
+    ):
+        _fail("execution_constraints.max_changed_files must be a positive integer")
+    for entry in policy["entries"]:
+        if entry["ro_enforcement"] != "required":  # pragma: no cover - schema
+            # There is no third context and no automatic downgrade. Unsupported
+            # isolation is BLOCKED at execution, never substituted.
+            _fail(
+                "validation_policy entries require actual kernel read-only "
+                "enforcement; there is no automatic downgrade"
+            )
+    return {
+        "version": D2_EXECUTION_CONSTRAINTS_VERSION,
+        "allowed_paths": allowed,
+        "denied_paths": denied,
+        "criteria": criteria,
+        "required_validation": required,
+        "max_changed_files": maximum,
+        "validation_policy": policy,
     }
 
 
@@ -2724,7 +3025,8 @@ def _validate_candidate(
         )
     elif strict:
         _fail(
-            "Strict-execution candidates must include version 1 execution_constraints"
+            "Strict-execution candidates must include version 1 or version 2 "
+            "execution_constraints"
         )
     return candidate
 
@@ -3741,6 +4043,8 @@ def _build_projection(state: dict[str, Any]) -> dict[str, Any]:
                 "source_drift",
                 "implementation_gate",
                 "closed_gates",
+                "d2",
+                "formal_repair_budget",
             )
             if key in overlay
         }
@@ -3922,6 +4226,7 @@ def _build_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
                 "source_drift",
                 "closed_gates",
                 "formal_repair_budget",
+                "d2",
             )
             if key in overlay
         }
@@ -4401,6 +4706,67 @@ def _execution_constraints_lines(
         return []
     if not isinstance(constraints, dict):
         return ["- (invalid execution constraints)"]
+    if constraints.get("version") == D2_EXECUTION_CONSTRAINTS_VERSION:
+        policy = constraints.get("validation_policy") or {}
+        lines = [
+            "### Execution constraints (version 2)",
+            "",
+            "Allowed repository-relative patterns (exact approved globs):",
+            "",
+            _md_list(list(constraints.get("allowed_paths") or [])),
+            "",
+            "Denied repository-relative patterns:",
+            "",
+            _md_list(list(constraints.get("denied_paths") or [])),
+            "",
+            "Stable acceptance criteria IDs and text digests:",
+            "",
+            _md_list(
+                [
+                    f"`{item['id']}` — `{item['text_sha256']}`"
+                    for item in constraints.get("criteria") or []
+                ]
+            ),
+            "",
+            "Approved ordered validation policy:",
+            "",
+            _md_list(
+                [
+                    (
+                        f"`{entry.get('invocation_id')}` **{entry.get('label')}** "
+                        f"— argv `"
+                        + json.dumps(entry.get("argv"), ensure_ascii=False)
+                        + f"`, cwd `{entry.get('cwd')}`, context "
+                        f"`{entry.get('context')}`, mandatory="
+                        f"{entry.get('mandatory')}, exit="
+                        f"{entry.get('expected_exit')}, timeout="
+                        f"{entry.get('timeout_seconds')}s, capture="
+                        f"{entry.get('capture_limit_bytes')}B, evidence="
+                        f"`{(entry.get('evidence') or {}).get('kind')}`, "
+                        f"RO={entry.get('ro_enforcement')}"
+                    )
+                    for entry in policy.get("entries") or []
+                ]
+            ),
+            "",
+            "Required literal validation argv (mandatory mirror):",
+            "",
+            _md_list(
+                [
+                    "`" + json.dumps(item.get("argv"), ensure_ascii=False) + "`"
+                    for item in constraints.get("required_validation") or []
+                ]
+            ),
+            "",
+            "Maximum changed files: "
+            + (
+                str(constraints.get("max_changed_files"))
+                if constraints.get("max_changed_files") is not None
+                else "(none declared)"
+            ),
+            "",
+        ]
+        return lines
     lines = [
         "### Execution constraints (version 1)",
         "",

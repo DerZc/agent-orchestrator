@@ -82,6 +82,33 @@ TYPE_BLOCKED = "implementation_blocked"
 TYPE_CONTINUATION = "continuation_authorized"
 TYPE_ABORTED = "implementation_aborted"
 
+# D2 facts live in the same append-only journal under separate reducer
+# namespaces. They never carry a top-level writer ``attempt_id``; their own
+# IDs and reference fields are validated by the D2 event schema hook.
+TYPE_VALIDATION_INTENT = "validation_intent"
+TYPE_VALIDATION_CLAIM = "validation_claim"
+TYPE_VALIDATION_RESULT = "validation_result"
+TYPE_VALIDATION_PREFLIGHT = "validation_preflight"
+TYPE_REVIEW_SESSION = "review_session"
+TYPE_REVIEW = "independent_review"
+TYPE_REPAIR_CONTRACT = "repair_contract"
+TYPE_REPAIR_ALLOCATION = "repair_allocation"
+TYPE_REPAIR_SETUP = "repair_setup_attempt"
+TYPE_DESIGN_LINK = "design_link"
+
+D2_EVENT_TYPES = {
+    TYPE_VALIDATION_INTENT,
+    TYPE_VALIDATION_CLAIM,
+    TYPE_VALIDATION_RESULT,
+    TYPE_VALIDATION_PREFLIGHT,
+    TYPE_REVIEW_SESSION,
+    TYPE_REVIEW,
+    TYPE_REPAIR_CONTRACT,
+    TYPE_REPAIR_ALLOCATION,
+    TYPE_REPAIR_SETUP,
+    TYPE_DESIGN_LINK,
+}
+
 EVENT_TYPES = {
     TYPE_ASSIGNMENT,
     TYPE_EVIDENCE,
@@ -93,6 +120,20 @@ EVENT_TYPES = {
     TYPE_BLOCKED,
     TYPE_CONTINUATION,
     TYPE_ABORTED,
+    *D2_EVENT_TYPES,
+}
+
+D2_JOURNAL_LISTS = {
+    TYPE_VALIDATION_INTENT: "validation_intents",
+    TYPE_VALIDATION_CLAIM: "validation_claims",
+    TYPE_VALIDATION_RESULT: "validation_results",
+    TYPE_VALIDATION_PREFLIGHT: "validation_preflights",
+    TYPE_REVIEW_SESSION: "review_sessions",
+    TYPE_REVIEW: "reviews",
+    TYPE_REPAIR_CONTRACT: "repair_contracts",
+    TYPE_REPAIR_ALLOCATION: "repair_allocations",
+    TYPE_REPAIR_SETUP: "repair_setups",
+    TYPE_DESIGN_LINK: "design_links",
 }
 
 _HOOKS: dict[str, Any] = {}
@@ -1011,6 +1052,7 @@ def _collect_protected_roots(
     workspace: Path,
     snapshot: dict[str, Any],
     contract: dict[str, Any],
+    known_owned: list[str] | tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Derive original protected-user roots without an ignored-content census.
 
@@ -1023,12 +1065,27 @@ def _collect_protected_roots(
         str(value) for value in (contract.get("allowed_paths") or []) if value
     ]
     entries = snapshot.get("entries") or {}
+    owned_paths = {
+        str(path) for path in known_owned if isinstance(path, str) and path
+    }
+
+    def is_owned(path: str) -> bool:
+        if path in owned_paths:
+            return True
+        return any(
+            path.startswith(owned.rstrip("/") + "/") for owned in owned_paths
+        )
+
     candidates: list[tuple[str, bool, str]] = []
     user_entries = _user_entries(snapshot)
     for path, entry in sorted(user_entries.items()):
         if not isinstance(entry, dict):
             continue
         if entry.get("kind") == "missing":
+            continue
+        if is_owned(path):
+            # A formal repair's exact attributed parent delta is owned source,
+            # never original user bytes.
             continue
         candidates.append(
             (path, entry.get("kind") == "directory", "user_baseline")
@@ -1383,7 +1440,9 @@ def derive_protection_manifest(
 ) -> dict[str, Any]:
     """Derive the coordinator-owned original protected-user manifest."""
     workspace = Path(workspace)
-    roots = _collect_protected_roots(workspace, snapshot, contract)
+    roots = _collect_protected_roots(
+        workspace, snapshot, contract, known_owned=known_owned
+    )
     anchors = _collect_protection_anchors(workspace, roots, contract)
     mutable_stat_paths = _writable_alias_guard(
         workspace, roots, known_owned=known_owned
@@ -1916,10 +1975,30 @@ PAYLOAD_OPTIONAL_KEYS: dict[str, set[str]] = {
         "protection_version",
         "protection_manifest_digest",
         "protection_manifest_blob_sha256",
+        # D2 formal repair intents keep the same writer reducer while binding
+        # the durable allocation, frozen repair contract and parent lineage.
+        "repair_allocation_id",
+        "repair_contract_digest",
+        "parent_attempt_id",
+        "parent_job_id",
+        "repair_generation",
     },
-    TYPE_CLAIM: {"protection_manifest_digest"},
-    TYPE_RESULT: {"protection_manifest_digest", "confinement_digest"},
-    TYPE_COMPLETE: {"protection_manifest_digest", "confinement_digest"},
+    TYPE_CLAIM: {
+        "protection_manifest_digest",
+        "repair_allocation_id",
+        "repair_contract_digest",
+    },
+    TYPE_RESULT: {
+        "protection_manifest_digest",
+        "confinement_digest",
+        "repair_allocation_id",
+    },
+    TYPE_COMPLETE: {
+        "protection_manifest_digest",
+        "confinement_digest",
+        "repair_allocation_id",
+        "parent_attempt_id",
+    },
 }
 
 
@@ -1989,6 +2068,12 @@ def _validate_workspace_evidence(value: Any, label: str) -> dict[str, Any]:
 def _validate_event_payload(event: dict[str, Any]) -> None:
     event_type = event["type"]
     payload = event["payload"]
+    if event_type in D2_EVENT_TYPES:
+        # D2 owns its strict schemas. The hook is mandatory: an unregistered
+        # D2 event must fail closed rather than be treated as an unknown type
+        # or silently accepted.
+        _hook("d2_event_validator")(event_type, payload)
+        return
     _optional_keys(
         payload,
         PAYLOAD_KEYS[event_type],
@@ -2113,8 +2198,53 @@ def _validate_event_payload(event: dict[str, Any]) -> None:
         if event_type == TYPE_INTENT:
             if payload.get("provider") != "deepseek":
                 _fail("implementation_intent must bind the reserved deepseek writer")
-            if payload.get("operation") != "implementation":
-                _fail("implementation_intent must bind the implementation operation")
+            repair_allocation = payload.get("repair_allocation_id")
+            if repair_allocation is None:
+                if payload.get("operation") != "implementation":
+                    _fail(
+                        "implementation_intent must bind the implementation operation"
+                    )
+                for key in (
+                    "repair_contract_digest",
+                    "parent_attempt_id",
+                    "parent_job_id",
+                    "repair_generation",
+                ):
+                    if payload.get(key) is not None:
+                        _fail(
+                            f"implementation_intent cannot carry {key} without a "
+                            "repair allocation"
+                        )
+            else:
+                _require_id(
+                    repair_allocation, "implementation_intent.repair_allocation_id"
+                )
+                if payload.get("operation") != "repair":
+                    _fail(
+                        "A repair intent must bind the reserved repair operation"
+                    )
+                _require_digest(
+                    payload.get("repair_contract_digest"),
+                    "implementation_intent.repair_contract_digest",
+                )
+                _require_digest(
+                    payload.get("parent_attempt_id"),
+                    "implementation_intent.parent_attempt_id",
+                )
+                _require_id(
+                    payload.get("parent_job_id"),
+                    "implementation_intent.parent_job_id",
+                )
+                generation = payload.get("repair_generation")
+                if (
+                    not isinstance(generation, int)
+                    or isinstance(generation, bool)
+                    or not 1 <= generation <= FORMAL_REPAIR_LIMIT
+                ):
+                    _fail(
+                        "implementation_intent.repair_generation must be 1.."
+                        f"{FORMAL_REPAIR_LIMIT}"
+                    )
             if payload.get("capability") != "workspace_write":
                 _fail("implementation_intent must bind a workspace-write capability")
             _validate_process_issuer(payload.get("issuer"), "implementation_intent.issuer")
@@ -2235,6 +2365,7 @@ def _empty_journal(plan_id: str) -> dict[str, Any]:
         "blocks": [],
         "continuations": [],
         "aborts": [],
+        **{name: [] for name in D2_JOURNAL_LISTS.values()},
     }
 
 
@@ -2278,6 +2409,8 @@ def _replay_journal(plan_id: str) -> dict[str, Any]:
             state["continuations"].append(event)
         elif event_type == TYPE_ABORTED:
             state["aborts"].append(event)
+        elif event_type in D2_EVENT_TYPES:
+            state[D2_JOURNAL_LISTS[event_type]].append(event)
         state["events"].append(event)
     return state
 
@@ -3126,6 +3259,16 @@ def validate_discussion_launch(
 # Frozen post-consensus execution contract
 # ---------------------------------------------------------------------------
 
+# D2 freezes its voted validation policy inside a new explicit contract
+# version. Version 1 contracts remain byte-identical and never acquire D2
+# authority; D2 operations refuse a version 1 contract.
+CONTRACT_VERSION_D2 = 2
+D2_VALIDATION_POLICY_VERSION = 1
+MAX_VALIDATION_ENTRIES = 32
+MAX_VALIDATION_CAPTURE = 8 * 1024 * 1024
+MIN_VALIDATION_CAPTURE = 1_024
+MAX_VALIDATION_TIMEOUT = 3_600
+
 CONTRACT_KEYS = {
     "version",
     "plan_id",
@@ -3298,7 +3441,24 @@ def _mechanically_restrict_contract(
             "contract drops approved required validation argv: "
             + json.dumps(missing_commands[0])
         )
-    if contract["version"] != EXECUTION_VERSION:
+    if contract["version"] == CONTRACT_VERSION_D2:
+        if constraints.get("version") != CONTRACT_VERSION_D2:
+            _fail(
+                "A version 2 contract requires an approved version 2 candidate "
+                "validation policy"
+            )
+        approved_policy = constraints.get("validation_policy")
+        if approved_policy != contract.get("validation_policy"):
+            _fail(
+                "contract validation_policy must exactly equal the approved "
+                "candidate policy; it cannot add, drop or widen an invocation"
+            )
+        if contract["required_validation"] != constraints["required_validation"]:
+            _fail(
+                "contract required_validation must exactly mirror the approved "
+                "mandatory validation invocations"
+            )
+    elif contract["version"] != EXECUTION_VERSION:
         _fail("contract version is not supported")
     protected = contract["protected_branches"]
     if not protected:
@@ -3317,6 +3477,183 @@ def _mechanically_restrict_contract(
         _fail("Contract freeze requires a repository HEAD commit")
 
 
+def _normalize_contract_validation_policy(raw: Any) -> dict[str, Any]:
+    """Validate the frozen validation-policy bytes without inventing values.
+
+    The contract may repeat the approved policy exactly or mechanically drop an
+    optional entry; it can never add, alter or widen one. Full restriction proof
+    runs in ``_mechanically_restrict_contract`` against the approved candidate.
+    """
+    value = _exact_keys(
+        raw, {"version", "entries"}, "contract.validation_policy"
+    )
+    if value.get("version") != D2_VALIDATION_POLICY_VERSION:
+        _fail("contract.validation_policy version is not supported")
+    entries = value.get("entries")
+    if not isinstance(entries, list) or not entries:
+        _fail("contract.validation_policy.entries must be non-empty")
+    if len(entries) > MAX_VALIDATION_ENTRIES:
+        _fail("contract.validation_policy has too many entries")
+    normalized: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        label = f"contract.validation_policy.entries[{index}]"
+        item = _exact_keys(
+            entry,
+            {
+                "invocation_id",
+                "label",
+                "argv",
+                "cwd",
+                "context",
+                "purpose",
+                "mandatory",
+                "expected_exit",
+                "timeout_seconds",
+                "capture_limit_bytes",
+                "environment_policy",
+                "ro_enforcement",
+                "evidence",
+            },
+            label,
+        )
+        invocation_id = item.get("invocation_id")
+        if not isinstance(invocation_id, str) or not re.fullmatch(
+            r"^V[0-9]{3}$", invocation_id
+        ):
+            _fail(f"{label}.invocation_id is invalid")
+        argv = item.get("argv")
+        if not isinstance(argv, list) or not argv:
+            _fail(f"{label}.argv must be a non-empty literal argument array")
+        if len(argv) > 64:
+            _fail(f"{label}.argv has too many arguments")
+        clean_argv: list[str] = []
+        for arg_index, argument in enumerate(argv):
+            if not isinstance(argument, str) or not argument:
+                _fail(f"{label}.argv[{arg_index}] must be a non-empty string")
+            if len(argument.encode("utf-8")) > 4_096:
+                _fail(f"{label}.argv[{arg_index}] is too long")
+            if "\x00" in argument or "\n" in argument or "\r" in argument:
+                _fail(f"{label}.argv[{arg_index}] must be one literal argument")
+            clean_argv.append(argument)
+        cwd = item.get("cwd")
+        if not isinstance(cwd, str) or not cwd or cwd.startswith("/"):
+            _fail(f"{label}.cwd must be repository-relative")
+        if any(part == ".." for part in Path(cwd).parts):
+            _fail(f"{label}.cwd must not escape the repository")
+        if item.get("context") not in {"ordinary_ro", "systems_trusted"}:
+            _fail(f"{label}.context is invalid")
+        if not isinstance(item.get("mandatory"), bool):
+            _fail(f"{label}.mandatory must be a boolean")
+        expected_exit = item.get("expected_exit")
+        if (
+            not isinstance(expected_exit, int)
+            or isinstance(expected_exit, bool)
+            or not 0 <= expected_exit <= 255
+        ):
+            _fail(f"{label}.expected_exit is invalid")
+        timeout = item.get("timeout_seconds")
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 1 <= timeout <= MAX_VALIDATION_TIMEOUT
+        ):
+            _fail(f"{label}.timeout_seconds is invalid")
+        capture = item.get("capture_limit_bytes")
+        if (
+            not isinstance(capture, int)
+            or isinstance(capture, bool)
+            or not MIN_VALIDATION_CAPTURE <= capture <= MAX_VALIDATION_CAPTURE
+        ):
+            _fail(f"{label}.capture_limit_bytes is invalid")
+        if item.get("environment_policy") != "minimal_private":
+            _fail(f"{label}.environment_policy is not supported")
+        if item.get("ro_enforcement") != "required":
+            _fail(
+                f"{label}.ro_enforcement must be required; observed or "
+                "unconfined read-only execution is not an eligible D2 context"
+            )
+        evidence = item.get("evidence")
+        if not isinstance(evidence, dict):
+            _fail(f"{label}.evidence must be a JSON object")
+        evidence_kind = evidence.get("kind")
+        if evidence_kind == "command_check":
+            _exact_keys(evidence, {"kind"}, f"{label}.evidence")
+            clean_evidence: dict[str, Any] = {"kind": "command_check"}
+        elif evidence_kind == "structured_unittest":
+            evidence_value = _exact_keys(
+                evidence,
+                {"kind", "adapter", "report_env", "min_collected", "min_run"},
+                f"{label}.evidence",
+            )
+            adapter = _exact_keys(
+                evidence_value.get("adapter"),
+                {"id", "version", "path", "sha256"},
+                f"{label}.evidence.adapter",
+            )
+            if adapter.get("id") != "coordinator-stdlib-unittest":
+                _fail(f"{label}.evidence.adapter.id is not the pinned adapter")
+            if adapter.get("version") != 1:
+                _fail(f"{label}.evidence.adapter.version is not supported")
+            adapter_path = adapter.get("path")
+            if not isinstance(adapter_path, str) or not adapter_path.startswith("/"):
+                _fail(f"{label}.evidence.adapter.path must be absolute")
+            adapter_sha = adapter.get("sha256")
+            if not isinstance(adapter_sha, str) or not DIGEST_RE.fullmatch(
+                adapter_sha
+            ):
+                _fail(f"{label}.evidence.adapter.sha256 is invalid")
+            report_env = evidence_value.get("report_env")
+            if not isinstance(report_env, str) or not re.fullmatch(
+                r"^[A-Z_][A-Z0-9_]{0,63}$", report_env
+            ):
+                _fail(f"{label}.evidence.report_env is invalid")
+            for key in ("min_collected", "min_run"):
+                floor = evidence_value.get(key)
+                if (
+                    not isinstance(floor, int)
+                    or isinstance(floor, bool)
+                    or not 1 <= floor <= 1_000_000
+                ):
+                    _fail(f"{label}.evidence.{key} is invalid")
+            clean_evidence = {
+                "kind": "structured_unittest",
+                "adapter": {
+                    "id": "coordinator-stdlib-unittest",
+                    "version": 1,
+                    "path": adapter_path,
+                    "sha256": adapter_sha,
+                },
+                "report_env": report_env,
+                "min_collected": evidence_value["min_collected"],
+                "min_run": evidence_value["min_run"],
+            }
+        else:
+            _fail(f"{label}.evidence.kind is invalid")
+        normalized.append(
+            {
+                "invocation_id": invocation_id,
+                "label": _text(item.get("label"), f"{label}.label", minimum=2),
+                "argv": clean_argv,
+                "cwd": cwd,
+                "context": item["context"],
+                "purpose": _text(
+                    item.get("purpose"), f"{label}.purpose", minimum=10
+                ),
+                "mandatory": item["mandatory"],
+                "expected_exit": expected_exit,
+                "timeout_seconds": timeout,
+                "capture_limit_bytes": capture,
+                "environment_policy": "minimal_private",
+                "ro_enforcement": item["ro_enforcement"],
+                "evidence": clean_evidence,
+            }
+        )
+    ids = [entry["invocation_id"] for entry in normalized]
+    if len(set(ids)) != len(ids):
+        _fail("contract.validation_policy repeats an invocation ID")
+    return {"version": D2_VALIDATION_POLICY_VERSION, "entries": normalized}
+
+
 def _normalize_contract(
     raw: Any,
     *,
@@ -3327,7 +3664,15 @@ def _normalize_contract(
 ) -> dict[str, Any]:
     if len(_canonical_bytes(raw)) > MAX_CONTRACT_BYTES:
         _fail(f"Execution contract exceeds {MAX_CONTRACT_BYTES} bytes")
-    value = _exact_keys(raw, CONTRACT_KEYS, "contract")
+    if not isinstance(raw, dict):
+        _fail("contract must be a JSON object")
+    contract_version = raw.get("version")
+    keys = set(CONTRACT_KEYS)
+    if contract_version == CONTRACT_VERSION_D2:
+        keys.add("validation_policy")
+    elif contract_version != EXECUTION_VERSION:
+        _fail("contract version is not supported")
+    value = _exact_keys(raw, keys, "contract")
     contract = {
         "version": value.get("version"),
         "plan_id": value.get("plan_id"),
@@ -3371,6 +3716,10 @@ def _normalize_contract(
             value.get("reporting"), "contract.reporting", minimum_chars=3
         ),
     }
+    if contract_version == CONTRACT_VERSION_D2:
+        contract["validation_policy"] = _normalize_contract_validation_policy(
+            value.get("validation_policy")
+        )
     criteria = value.get("acceptance_criteria")
     if not isinstance(criteria, list) or not criteria:
         _fail("contract.acceptance_criteria must be a non-empty JSON array")
@@ -3723,10 +4072,14 @@ def _active_or_blocking_ownership(
     cycle: int | None = None,
     candidate_sha256: str | None = None,
     exclude_attempt: str | None = None,
+    exclude_attempts: Any = None,
 ) -> list[str]:
+    excluded = set(exclude_attempts or ())
+    if exclude_attempt is not None:
+        excluded.add(exclude_attempt)
     problems: list[str] = []
     for attempt in _all_attempt_states(journal):
-        if attempt["attempt_id"] == exclude_attempt:
+        if attempt["attempt_id"] in excluded:
             continue
         state = attempt["state"]
         if state in {"pending", "claimed", "uncertain", "blocked"}:
@@ -4015,6 +4368,7 @@ def prepare_implementation(
                 "execution-contract after unanimous consensus"
             )
         contract = _load_contract(plan_id, journal, contract_event)
+        _require_no_d2_initial_writer(journal, step_id)
         identity = _repo_identity(static)
         workspace = Path(static["canonical_workspace"])
         latest_intent = _latest_intent_for(
@@ -4452,6 +4806,329 @@ def prepare_implementation(
         }
 
 
+def _repair_binding() -> Any:
+    module = _HOOKS.get("review_module")
+    if module is None:
+        _fail("D2 repair admission is unavailable; failing closed")
+    return module()
+
+
+def _require_no_d2_initial_writer(journal: dict[str, Any], step_id: str) -> None:
+    """No second initial writer may escape an allocated/rejected D2 path."""
+    allocations = [
+        event
+        for event in journal.get("repair_allocations", [])
+        if event["step_id"] == step_id
+    ]
+    reviews = [
+        event for event in journal.get("reviews", []) if event["step_id"] == step_id
+    ]
+    if allocations or reviews:
+        _fail(
+            "This step already entered D2 review/repair ownership; the initial "
+            "implementation path is closed. Use the formal repair path."
+        )
+
+
+def prepare_repair_implementation(
+    *, plan_id: str, step_id: str, allocation_id: str
+) -> dict[str, Any]:
+    """Prepare a new versioned repair intent bound to one durable allocation."""
+    start = _b2().process_start_identity(os.getpid())
+    if not isinstance(start, str) or not start:
+        _fail("Cannot record a deterministic repair issuer process identity")
+    with _b1().plan_lock(plan_id):
+        b1_state = _b1().replay_plan_state_locked(plan_id)
+        static = _require_strict_plan(b1_state)
+        current = _require_consensus(b1_state, step_id)
+        constraints, candidate_sha256 = _candidate_constraints(b1_state, step_id)
+        if constraints.get("version") != CONTRACT_VERSION_D2:
+            _fail("Formal repair requires an approved version 2 candidate policy")
+        journal = _replay_journal(plan_id)
+        contract_event = _contract_event_for(
+            journal, step_id, current["cycle"], candidate_sha256
+        )
+        if contract_event is None:
+            _fail("No execution contract is frozen for the repair")
+        contract = _load_contract(plan_id, journal, contract_event)
+        if contract.get("version") != CONTRACT_VERSION_D2:
+            _fail("Formal repair requires a frozen version 2 contract")
+        identity = _repo_identity(static)
+        if identity.get("root") != static["canonical_workspace"]:
+            _fail("Repair preparation is in another canonical workspace")
+        workspace = Path(static["canonical_workspace"])
+        _lease_preflight(identity)
+        live = _live_reservations(identity)
+        if live:
+            _fail(
+                "A repository job is still active or draining: "
+                + ", ".join(sorted(str(record.get("job_id")) for record in live))
+            )
+        snapshot = _observe_workspace(workspace, contract, extra_paths=[])
+        binding = _repair_binding().repair_admission_locked(
+            plan_id=plan_id,
+            step_id=step_id,
+            allocation_id=allocation_id,
+            journal=journal,
+            b1_state=b1_state,
+            contract=contract,
+            contract_event=contract_event,
+            snapshot=snapshot,
+            static=static,
+            constraints=constraints,
+            current=current,
+            candidate_sha256=candidate_sha256,
+        )
+        attempt_id = binding["attempt_id"]
+        generation = int(binding["generation"])
+        existing_intents = [
+            event
+            for event in journal["intents"]
+            if event["payload"].get("repair_allocation_id") == allocation_id
+        ]
+        if existing_intents:
+            latest = existing_intents[-1]
+            payload = latest["payload"]
+            state = _attempt_state(journal, payload["attempt_id"])
+            if state["state"] != "pending":
+                _fail(
+                    f"The repair attempt is {state['state']}; no second setup can "
+                    "reuse this formal slot"
+                )
+            job_dir = _jobs_dir() / payload["job_id"]
+            issuer = payload["issuer"]
+            same_issuer = (
+                issuer.get("pid") == os.getpid()
+                and issuer.get("start") == start
+            )
+            if job_dir.exists() and not same_issuer:
+                _fail(
+                    "The pending repair intent has an existing job directory; "
+                    "ambiguity blocks setup"
+                )
+            if _process_probe(issuer) != "dead" and not same_issuer:
+                _fail("The pending repair intent is owned by a live issuer process")
+            if (
+                payload["base_snapshot_digest"]
+                != _snapshot_digest(snapshot)
+                or payload["repair_contract_digest"]
+                != binding["repair_contract_digest"]
+            ):
+                _fail(
+                    "A different pending repair intent exists for this allocation"
+                )
+            descriptor = _repair_descriptor(
+                plan_id,
+                step_id,
+                current["cycle"],
+                candidate_sha256,
+                contract,
+                contract_event,
+                binding,
+                latest,
+                snapshot,
+                static,
+                workspace,
+            )
+            return descriptor
+        blocking = _active_or_blocking_ownership(
+            journal,
+            step_id=step_id,
+            cycle=current["cycle"],
+            candidate_sha256=candidate_sha256,
+            # repair_admission_locked proved the exact settled source/rejection
+            # lineage of this allocation, including every accumulated failed
+            # ancestor. Only those proven attempts may transfer ownership to the
+            # new formal repair; every other residue remains blocking.
+            exclude_attempts=binding.get("superseded_attempt_ids") or (),
+        )
+        if blocking:
+            _fail(
+                "Another execution attempt still owns state for this step: "
+                + "; ".join(blocking)
+            )
+        protected_contract = dict(contract)
+        protected_contract["allowed_paths"] = list(
+            binding["repair_contract"]["allowed_paths"]
+        )
+        protected_contract["denied_paths"] = list(
+            binding["repair_contract"]["denied_paths"]
+        )
+        protection_manifest = derive_protection_manifest(
+            workspace,
+            snapshot,
+            protected_contract,
+            plan_id=plan_id,
+            step_id=step_id,
+            cycle=current["cycle"],
+            candidate_sha256=candidate_sha256,
+            contract_digest=contract_event["payload"]["contract_digest"],
+            plan_sha256=static["plan_sha256"],
+            b1_manifest_digest=static["manifest_digest"],
+            known_owned=list(binding["owned_paths"]),
+        )
+        _require_owned_outside_protection(
+            protection_manifest,
+            list(binding["owned_paths"]),
+            "formal repair",
+        )
+        _writable_alias_guard(
+            workspace,
+            protection_manifest["roots"],
+            known_owned=list(binding["owned_paths"]),
+        )
+        protection_blob, _ = _publish_json_blob(
+            plan_id, protection_manifest, "repair protected-user manifest"
+        )
+        base_digest = _snapshot_digest(snapshot)
+        base_blob, _ = _publish_json_blob(
+            plan_id, snapshot, "repair invocation base snapshot"
+        )
+        task_text = binding["task_text"]
+        task_file = Path(binding["task_file"])
+        task_sha = _sha256_bytes(task_file.read_bytes())
+        next_sequence = len(journal["events"]) + 1
+        job_id = "rep-" + _digest(
+            {
+                "attempt_id": attempt_id,
+                "base_snapshot_digest": base_digest,
+                "sequence": next_sequence,
+            }
+        )[:48]
+        index = snapshot.get("index") or {}
+        payload = {
+            "version": EXECUTION_VERSION,
+            "attempt_id": attempt_id,
+            "job_id": job_id,
+            "invocation": 1,
+            "cycle": current["cycle"],
+            "candidate_sha256": candidate_sha256,
+            "contract_digest": contract_event["payload"]["contract_digest"],
+            "plan_sha256": static["plan_sha256"],
+            "manifest_digest": static["manifest_digest"],
+            "provider": "deepseek",
+            "operation": "repair",
+            "capability": "workspace_write",
+            "issuer": {"pid": os.getpid(), "start": start},
+            "base_snapshot_digest": base_digest,
+            "base_snapshot_blob_sha256": base_blob,
+            "original_base_snapshot_digest": binding[
+                "original_base_snapshot_digest"
+            ],
+            "original_base_blob_sha256": binding["original_base_blob_sha256"],
+            "head": snapshot.get("head"),
+            "branch": snapshot.get("branch"),
+            "index_sha256": index.get("sha256"),
+            "user_baseline_digest": binding["user_baseline_digest"],
+            "task_source_sha256": task_sha,
+            "protection_version": PROTECTION_VERSION,
+            "protection_manifest_digest": protection_manifest["manifest_sha256"],
+            "protection_manifest_blob_sha256": protection_blob,
+            "continuation_of": None,
+            "repair_allocation_id": allocation_id,
+            "repair_contract_digest": binding["repair_contract_digest"],
+            "parent_attempt_id": binding["parent_attempt_id"],
+            "parent_job_id": binding["parent_job_id"],
+            "repair_generation": generation,
+        }
+        request_digest = _request_digest(
+            "repair-intent",
+            plan_id=plan_id,
+            step_id=step_id,
+            payload=payload,
+        )
+        events = _append_journal(
+            plan_id,
+            [
+                {
+                    "type": TYPE_INTENT,
+                    "step_id": step_id,
+                    "cycle": current["cycle"],
+                    "payload": payload,
+                }
+            ],
+            _next_operation("drepair", request_digest),
+            request_digest,
+        )
+        return _repair_descriptor(
+            plan_id,
+            step_id,
+            current["cycle"],
+            candidate_sha256,
+            contract,
+            contract_event,
+            binding,
+            events[0],
+            snapshot,
+            static,
+            workspace,
+        )
+
+
+def _repair_descriptor(
+    plan_id: str,
+    step_id: str,
+    cycle: int,
+    candidate_sha256: str,
+    contract: dict[str, Any],
+    contract_event: dict[str, Any],
+    binding: dict[str, Any],
+    intent_event: dict[str, Any],
+    snapshot: dict[str, Any],
+    static: dict[str, Any],
+    workspace: Path,
+) -> dict[str, Any]:
+    payload = intent_event["payload"]
+    repair_contract = binding["repair_contract"]
+    return {
+        "version": EXECUTION_VERSION,
+        "kind": "implementation",
+        "plan_id": plan_id,
+        "step_id": step_id,
+        "cycle": cycle,
+        "round": None,
+        "role": "deepseek",
+        "provider": "deepseek",
+        "operation": "repair",
+        "job_id": payload["job_id"],
+        "attempt_id": payload["attempt_id"],
+        "invocation": payload["invocation"],
+        "candidate_sha256": candidate_sha256,
+        "contract_digest": contract_event["payload"]["contract_digest"],
+        "intent_digest": intent_event["digest"],
+        "intent_event_id": intent_event["event_id"],
+        "assignment_digest": intent_event["digest"],
+        "assignment_event_id": intent_event["event_id"],
+        "task_source_sha256": payload["task_source_sha256"],
+        "base_snapshot_digest": payload["base_snapshot_digest"],
+        "continuation": False,
+        "repair": True,
+        "repair_allocation_id": binding["allocation_id"],
+        "repair_contract_digest": binding["repair_contract_digest"],
+        "repair_generation": binding["generation"],
+        "protected_contract_allowed_paths": list(repair_contract["allowed_paths"]),
+        "protection": _protection_inputs(
+            _protection_manifest_from_intent(
+                plan_id, payload, "repair descriptor"
+            )
+        ),
+        "protection_manifest_digest": payload["protection_manifest_digest"],
+        "protection_manifest_blob_sha256": payload[
+            "protection_manifest_blob_sha256"
+        ],
+        "constraints": None,
+        "contract": contract,
+        "contract_prompt": binding["task_text"],
+        "target_branch": contract["target_branch"],
+        "protected_branches": list(contract["protected_branches"]),
+        "allowed_paths": list(repair_contract["allowed_paths"]),
+        "denied_paths": list(repair_contract["denied_paths"]),
+        "max_changed_files": contract.get("max_changed_files"),
+        "task_file": str(binding["task_file"]),
+        "workspace": static["canonical_workspace"],
+    }
+
+
 def validate_implementation_launch(
     descriptor: dict[str, Any], identity: dict[str, Any]
 ) -> None:
@@ -4475,6 +5152,48 @@ def validate_implementation_launch(
         if intent["digest"] != descriptor.get("intent_digest"):
             _fail("Managed implementation launch does not match its protected intent")
         payload = intent["payload"]
+        superseded_attempts: list[str] = []
+        if descriptor.get("operation") != payload.get("operation"):
+            _fail("Managed implementation launch operation does not match its intent")
+        if bool(descriptor.get("repair")) != bool(
+            payload.get("repair_allocation_id")
+        ):
+            _fail("Managed implementation repair flag does not match its intent")
+        if payload.get("repair_allocation_id") is not None:
+            repair_snapshot = _observe_workspace(
+                Path(identity["root"]), _load_contract(
+                    plan_id,
+                    journal,
+                    _contract_event_for(
+                        journal, step_id, current["cycle"], candidate_sha256
+                    ),
+                ), extra_paths=[]
+            )
+            repair_admission = _repair_binding().repair_admission_locked(
+                plan_id=plan_id,
+                step_id=step_id,
+                allocation_id=payload["repair_allocation_id"],
+                journal=journal,
+                b1_state=b1_state,
+                contract=_load_contract(
+                    plan_id,
+                    journal,
+                    _contract_event_for(
+                        journal, step_id, current["cycle"], candidate_sha256
+                    ),
+                ),
+                contract_event=_contract_event_for(
+                    journal, step_id, current["cycle"], candidate_sha256
+                ),
+                snapshot=repair_snapshot,
+                static=static,
+                constraints=constraints,
+                current=current,
+                candidate_sha256=candidate_sha256,
+            )
+            superseded_attempts = list(
+                repair_admission.get("superseded_attempt_ids") or ()
+            )
         if payload.get("job_id") != job_id:
             _fail("Managed implementation intent names another job")
         if payload["invocation"] > _invocation_limit(static):
@@ -4505,6 +5224,7 @@ def validate_implementation_launch(
             cycle=current["cycle"],
             candidate_sha256=candidate_sha256,
             exclude_attempt=payload["attempt_id"],
+            exclude_attempts=superseded_attempts,
         )
         if blocking:
             _fail(
@@ -4588,10 +5308,14 @@ def claim_implementation(
             plan_id, journal, claim_contract_event
         )
         _require_branch_and_head(snapshot, claim_contract, "implementation claim")
-        if payload.get("continuation_of") is None:
+        if payload.get("continuation_of") is None and payload.get(
+            "repair_allocation_id"
+        ) is None:
             # Re-establish protected pre-existing content at the post-lease
             # admission point using the authoritative snapshot, independently
             # of status-only tracked membership, before publishing the claim.
+            # A formal repair is exempt only for its exact attributable parent
+            # delta, proven by repair_admission_locked below.
             _require_no_protected_scope_overlap(
                 _annotated_snapshot(snapshot, Path(identity["root"])),
                 claim_contract,
@@ -4629,6 +5353,38 @@ def claim_implementation(
             claim_manifest["roots"],
             known_owned=claim_owned,
         )
+        superseded_attempts: list[str] = []
+        if payload.get("repair_allocation_id") is not None:
+            repair_admission = _repair_binding().repair_admission_locked(
+                plan_id=plan_id,
+                step_id=step_id,
+                allocation_id=payload["repair_allocation_id"],
+                journal=journal,
+                b1_state=b1_state,
+                contract=claim_contract,
+                contract_event=claim_contract_event,
+                snapshot=snapshot,
+                static=static,
+                constraints=constraints,
+                current=current,
+                candidate_sha256=candidate_sha256,
+            )
+            superseded_attempts = list(
+                repair_admission.get("superseded_attempt_ids") or ()
+            )
+        blocking = _active_or_blocking_ownership(
+            journal,
+            step_id=step_id,
+            cycle=current["cycle"],
+            candidate_sha256=candidate_sha256,
+            exclude_attempt=payload["attempt_id"],
+            exclude_attempts=superseded_attempts,
+        )
+        if blocking:
+            _fail(
+                "Another execution attempt still owns state for this claim: "
+                + "; ".join(blocking)
+            )
         lease_meta = {
             "epoch": lease.epoch,
             "owner_path": str(lease.paths["owner"]),
@@ -4653,6 +5409,14 @@ def claim_implementation(
             "head": snapshot.get("head"),
             "branch": snapshot.get("branch"),
             "index_sha256": (snapshot.get("index") or {}).get("sha256"),
+            **(
+                {
+                    "repair_allocation_id": payload["repair_allocation_id"],
+                    "repair_contract_digest": payload["repair_contract_digest"],
+                }
+                if payload.get("repair_allocation_id") is not None
+                else {}
+            ),
         }
         claim_digest = _digest(claim_facts)
         claim_payload = {
@@ -4768,7 +5532,8 @@ def validate_managed_worker(meta: dict[str, Any]) -> str | None:
                 return "Managed implementation must run as the reserved deepseek writer"
             binding = _c().binding_from_meta(meta)
             if (
-                binding.get("operation") != "implementation"
+                binding.get("operation")
+                not in {"implementation", "repair"}
                 or binding.get("capability") != "workspace_write"
             ):
                 return "Managed implementation binding is not the authorized writer"
@@ -4805,6 +5570,12 @@ def validate_managed_worker(meta: dict[str, Any]) -> str | None:
             intent = _intent_for_job(journal, job_id)
             if intent is None or intent["digest"] != descriptor.get("intent_digest"):
                 return "Managed implementation intent does not match the job"
+            if binding.get("operation") != intent["payload"].get("operation"):
+                return "Managed implementation binding operation changed"
+            if bool(descriptor.get("repair_allocation_id")) != bool(
+                intent["payload"].get("repair_allocation_id")
+            ):
+                return "Managed implementation repair binding changed"
             claim = _claim_for_job(journal, job_id)
             if claim is None:
                 return "Managed implementation job has no protected claim"
@@ -4895,8 +5666,43 @@ def validate_managed_worker(meta: dict[str, Any]) -> str | None:
                 # Worker-side fresh-writer admission: re-establish protected
                 # pre-existing content from raw workspace observation, never
                 # from the earlier status-only view, before any provider call.
-                _require_no_protected_scope_overlap(
-                    snapshot, contract, "implementation worker"
+                # A formal repair is exempt only for its exact parent delta,
+                # which repair_admission_locked proves separately below.
+                if intent["payload"].get("repair_allocation_id") is None:
+                    _require_no_protected_scope_overlap(
+                        snapshot, contract, "implementation worker"
+                    )
+            superseded_attempts: list[str] = []
+            if intent["payload"].get("repair_allocation_id") is not None:
+                repair_admission = _repair_binding().repair_admission_locked(
+                    plan_id=plan_id,
+                    step_id=descriptor.get("step_id"),
+                    allocation_id=intent["payload"]["repair_allocation_id"],
+                    journal=journal,
+                    b1_state=b1_state,
+                    contract=contract,
+                    contract_event=contract_event,
+                    snapshot=snapshot,
+                    static=static,
+                    constraints=constraints,
+                    current=current,
+                    candidate_sha256=candidate_sha256,
+                )
+                superseded_attempts = list(
+                    repair_admission.get("superseded_attempt_ids") or ()
+                )
+            blocking = _active_or_blocking_ownership(
+                journal,
+                step_id=descriptor.get("step_id"),
+                cycle=current["cycle"],
+                candidate_sha256=candidate_sha256,
+                exclude_attempt=intent["payload"]["attempt_id"],
+                exclude_attempts=superseded_attempts,
+            )
+            if blocking:
+                return (
+                    "Another execution attempt still owns state for this job; "
+                    "failing closed: " + "; ".join(blocking)
                 )
             return None
     except Exception as exc:
@@ -5394,12 +6200,17 @@ def _validate_provider_completion(
     result = evidence["result"]
     provider_result = evidence["provider_result"]
     binding = evidence["binding"]
+    expected_operation = str(
+        (intent_payload or {}).get("operation") or "implementation"
+    )
     if meta.get("agent") != "deepseek" or meta.get("cli") != "deepseek":
         reasons.append("the job did not run as the reserved deepseek provider")
     if binding.get("provider") != "deepseek":
         reasons.append("the provider binding is not deepseek")
-    if binding.get("operation") != "implementation":
-        reasons.append("the provider binding is not an implementation operation")
+    if binding.get("operation") != expected_operation:
+        reasons.append(
+            f"the provider binding is not the expected {expected_operation} operation"
+        )
     if binding.get("capability") != "workspace_write":
         reasons.append("the provider binding is not a workspace-write capability")
     if result.get("state") != "succeeded":
@@ -5414,8 +6225,10 @@ def _validate_provider_completion(
         reasons.append("the C provider result was not validated")
     if provider_result.get("error") is not None:
         reasons.append("the C provider result records an error")
-    if provider_result.get("operation") != "implementation":
-        reasons.append("the C provider result is not an implementation report")
+    if provider_result.get("operation") != expected_operation:
+        reasons.append(
+            f"the C provider result is not an {expected_operation} report"
+        )
     if provider_result.get("capability") != "workspace_write":
         reasons.append("the C provider result is not a workspace-write report")
     protection_digest = (intent_payload or {}).get(
@@ -5639,6 +6452,11 @@ def _completion_payload(
     confinement = (
         protection.get("confinement") if isinstance(protection, dict) else None
     )
+    repair_fields = {
+        key: intent_payload[key]
+        for key in ("repair_allocation_id", "parent_attempt_id")
+        if intent_payload.get(key) is not None
+    }
     return {
         "version": EXECUTION_VERSION,
         "attempt_id": intent_payload["attempt_id"],
@@ -5646,6 +6464,7 @@ def _completion_payload(
         "invocation": intent_payload["invocation"],
         "candidate_sha256": intent_payload["candidate_sha256"],
         "contract_digest": intent_payload["contract_digest"],
+        **repair_fields,
         "protection_manifest_digest": protection.get("manifest_digest"),
         "confinement_digest": (
             _digest(confinement) if isinstance(confinement, dict) else None
@@ -5741,6 +6560,11 @@ def _record_result(
         "job_id": payload["job_id"],
         "invocation": payload["invocation"],
         "classification": classification,
+        **(
+            {"repair_allocation_id": payload["repair_allocation_id"]}
+            if payload.get("repair_allocation_id") is not None
+            else {}
+        ),
         "state": evidence.get("job_result_state"),
         "protection_manifest_digest": (
             (evidence.get("protection") or {}).get("manifest_digest")
@@ -5848,7 +6672,13 @@ def _record_result(
         "invocation": payload["invocation"],
         "classification": classification,
         "completed": completed,
-        "state": "IMPLEMENTATION_COMPLETE" if completed else classification,
+        "state": (
+            "REPAIR_APPLIED"
+            if completed and payload.get("repair_allocation_id")
+            else "IMPLEMENTATION_COMPLETE"
+            if completed
+            else classification
+        ),
         "reasons": list(reasons),
         "evidence_digest": evidence_digest,
         "evidence_blob_sha256": evidence_blob,
@@ -6088,6 +6918,12 @@ def authorize_continuation(
         if intent is None:
             _fail("No D1 implementation attempt exists for this candidate")
         payload = intent["payload"]
+        if payload.get("repair_allocation_id") is not None:
+            _fail(
+                "A formal repair invocation has no same-attempt continuation. A "
+                "claimed failure needs a fresh actual Codex rejection and a new "
+                "durable allocation; no retry or refund exists."
+            )
         state = _attempt_state(journal, payload["attempt_id"])
         if state["state"] != "drained_failure":
             _fail(
@@ -6251,7 +7087,10 @@ def finalize_implementation(
                 "classification": existing_result["payload"]["classification"],
                 "completed": completion is not None,
                 "state": (
-                    "IMPLEMENTATION_COMPLETE"
+                    "REPAIR_APPLIED"
+                    if completion is not None
+                    and payload.get("repair_allocation_id")
+                    else "IMPLEMENTATION_COMPLETE"
                     if completion is not None
                     else existing_result["payload"]["classification"]
                 ),
@@ -6391,7 +7230,10 @@ def finalize_implementation(
             )
         try:
             job_evidence = _job_evidence(
-                selected_job, "implementation", "deepseek", require_validated=False
+                selected_job,
+                str(payload.get("operation") or "implementation"),
+                "deepseek",
+                require_validated=False,
             )
         except Exception as exc:
             return _record_result(
@@ -7128,29 +7970,78 @@ def execution_overlay(*, plan_id: str, state: dict[str, Any]) -> dict[str, Any]:
             )
             missing = []
             blocked = []
+    budget = {
+        "limit": FORMAL_REPAIR_LIMIT,
+        "used": 0,
+        "remaining": FORMAL_REPAIR_LIMIT,
+        "lineage": "per-step across designs and restarts",
+        "consumption": "CLOSED_UNTIL_D2",
+    }
+    d2_view: dict[str, Any] | None = None
+    d2_hook = _HOOKS.get("d2_overlay")
+    if d2_hook is not None:
+        try:
+            d2_view = d2_hook(plan_id=plan_id, state=state, journal=journal)
+        except Exception as exc:
+            d2_view = {
+                "version": 1,
+                "active": False,
+                "stage": "BLOCKED",
+                "error": f"D2 overlay failed closed: {exc}",
+            }
+        if d2_view.get("active"):
+            for step_id, d2_step in (d2_view.get("steps") or {}).items():
+                if not d2_step.get("active"):
+                    continue
+                if step_id in steps:
+                    steps[step_id]["d2_stage"] = d2_step.get("stage")
+                    steps[step_id]["d2_next_action"] = d2_step.get(
+                        "next_action"
+                    )
+            if (
+                plan_stage in {"IMPLEMENTATION_COMPLETE", "READY_TO_IMPLEMENT"}
+                and d2_view.get("stage") is not None
+            ):
+                # A version 2 step with an actual D2-derived stage owns the
+                # plan stage even when D1's writer view looks "ready" (for
+                # example an aborted repair intent, or a linked new design
+                # cycle whose carry is not executable). A brand-new version 2
+                # step before any implementation emits no D2 stage and keeps
+                # the honest D1 ready-to-implement view.
+                plan_stage = str(d2_view.get("stage") or plan_stage)
+                next_action = str(d2_view.get("next_action") or next_action)
+                missing = list(d2_view.get("missing_actions") or missing)
+                blocked = list(d2_view.get("blocked_reasons") or blocked)
+            budget = (
+                d2_view.get("repair_budget")
+                or budget
+            )
+    d2_step_views = (d2_view or {}).get("steps") or {}
     return {
         "version": EXECUTION_VERSION,
         "stage": plan_stage,
         "next_action": next_action,
         "missing_actions": missing,
         "blocked_reasons": blocked,
-        "source_drift": any(view.get("source_drift") for view in ordered),
+        "source_drift": any(view.get("source_drift") for view in ordered)
+        or any(
+            isinstance(d2_step_views.get(step["id"]), dict)
+            and d2_step_views[step["id"]].get("source_drift")
+            for step in static["manifest"]["steps"]
+        ),
         "steps": steps,
         "attempt": next(
             (view["attempt"] for view in ordered if view["attempt"]), None
         ),
-        "formal_repair_budget": {
-            "limit": FORMAL_REPAIR_LIMIT,
-            "used": 0,
-            "remaining": FORMAL_REPAIR_LIMIT,
-            "lineage": "per-step across designs and restarts",
-            "consumption": "CLOSED_UNTIL_D2",
-        },
+        "d2": d2_view,
+        "formal_repair_budget": budget,
         "implementation_gate": (
             "D1_IMPLEMENTATION_COMPLETE_SOURCE_DRIFT"
             if any(view.get("source_drift") for view in ordered)
             else "D1_IMPLEMENTATION_COMPLETE_REVIEW_CLOSED"
             if plan_stage == "IMPLEMENTATION_COMPLETE"
+            else f"D2_{plan_stage}"
+            if d2_view and d2_view.get("active")
             else "D1_MANAGED_EXECUTION"
         ),
         "closed_gates": dict(CLOSED_GATES),
